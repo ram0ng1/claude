@@ -52,6 +52,8 @@ Base Github: https://github.com/ram0ng1/verified, https://github.com/ram0ng1/avo
 - §33 Severity calibration & quick triage
 - §34 **Patterns from official Flarum v2 extensions** (canonical citations)
 - §35 **CI/CD & GitHub Actions workflows** — baseline (lint, release, forum post) + 🔴🟠🟡⚪ hardening roadmap (SHA pinning, harden-runner, CodeQL, Dependabot, SLSA) + Claude scaffolding prompt
+- §36 **Shell command execution & external binaries** — `exec`/`proc_open`, FFmpeg/ImageMagick, argument injection, untrusted-media attack surface
+- §37 **Frontend `Content` injectors** (`Extend\Frontend->content()`) — SSR cost, raw-HTML `<head>` injection, `ApiResource` duplication
 
 ---
 
@@ -651,6 +653,7 @@ rg -n "->where\\(.*'like'" src/
 - `orderBy($request->input('sort'))` without a sort-column allowlist.
 - `LIKE` without escaping `%` and `_` from user input — user forces broader-than-intended matches (wildcard injection).
 - Any access to `$_GET`/`$_POST` directly. Always PSR-7: `$request->getQueryParams()`, `$request->getParsedBody()`, `$request->getUploadedFiles()`.
+- `Illuminate\Database\Capsule\Manager` used as a query entrypoint (`use Illuminate\Database\Capsule\Manager as DB; DB::table(...)`). It *works* because Flarum boots Capsule globally, but it's a convention smell — it reaches around Flarum's connection management and the static facade is fragile under tests and queue workers. Constructor-inject `Illuminate\Database\ConnectionInterface` (or `ConnectionResolverInterface`) and call `$this->db->table(...)`, or use an Eloquent model — Flarum already wires those. Reference smell: [src/Api/ForumAttributes.php:35](src/Api/ForumAttributes.php#L35) and [:55](src/Api/ForumAttributes.php#L55).
 
 ### Correct shape
 
@@ -1356,6 +1359,7 @@ rg -n "serializeToForum\\(" extend.php src/
 
 - Exposing any secret via `serializeToForum`: API keys, integration tokens, webhook URLs containing tokens, raw email addresses, internal IPs, license keys.
 - Exposing HTML/admin-controlled raw strings without a sanitizer cast.
+- **A server-side sanitizer applied to some admin-HTML fields but not others.** An extension that ships an `HtmlSanitizer` class AND uses it for one admin-HTML surface, but registers another as `->serializeToForum('jsKey', 'ext.html_key')` with **no cast argument** — that second field ships raw in the forum payload and relies *solely* on a JS-side mirror at render time. Per §9.2 the allowlist must hold on **both** sides; a JS-only guard means any mXSS bypass (DOMParser blocklist sanitizers commonly miss `<svg>`/`<math>`/`<noscript>` foreign-content) is guest-visible XSS with no server-side backstop. The cast closure is the only place a sanitizer runs for `serializeToForum` output — wire it there: `->serializeToForum('jsKey', 'ext.html_key', fn ($html) => HtmlSanitizer::sanitize($html), '')`. Reference asymmetry: [src/Content/CustomLoadingSpinner.php:39](src/Content/CustomLoadingSpinner.php#L39) sanitizes its admin HTML server-side, but [extend.php:163](extend.php#L163) serializes `avocado.custom_hero_html` raw — same extension, same `HtmlSanitizer`, inconsistent application.
 
 ### Correct shape
 
@@ -1816,6 +1820,17 @@ Before deleting:
 
 If all four return empty, delete is safe.
 
+### The "acknowledged no-op" anti-pattern
+
+A class left in `src/` with a comment — in `extend.php` or the class itself — that says
+something like *"remains as a no-op until removed in a future cleanup"* is still dead
+weight: it's autoloaded, it surfaces in greps, and it makes the next reader stop to work
+out whether it's wired. "Future cleanup" reliably never happens. **The PR that unwires a
+class is the PR that deletes its file** — they are the same change. If you're not ready
+to delete it, don't unwire it. Reference: [extend.php:32](extend.php#L32) comments
+`DeferMainCss` out of the `content()` chain, but
+[src/Content/DeferMainCss.php](src/Content/DeferMainCss.php) is still in the tree.
+
 ### Refactor order (safest first)
 
 1. Unused interfaces/types.
@@ -1862,6 +1877,8 @@ for "small" changes.**
 - [ ] Resources for per-user data implement `scope(Builder, Context)` to restrict rows.
 - [ ] No `->fill($body)`, `->forceFill(…)`, `Model::create($body)`, `protected $guarded = []`.
 - [ ] Extending core resources (`UserResource` etc.) — every new field has explicit `->visible()`.
+- [ ] `Content` injectors (`Extend\Frontend->content()`) check their enable/visibility setting first, bound every query (`limit()`), apply per-actor visibility, JSON_HEX-encode any user-controlled data put into `$document->head[]`/`foot[]`, and don't duplicate a query already served by an `ApiResource` field (§37).
+- [ ] No `Illuminate\Database\Capsule\Manager` (`DB::table(...)`) as a query entrypoint — inject `ConnectionInterface` or use an Eloquent model (§10).
 
 ### Backend — injection
 
@@ -1878,6 +1895,8 @@ for "small" changes.**
 - [ ] Image uploads re-encoded through Intervention\Image (or equivalent) — raw bytes not written to public disks.
 - [ ] Every private file served sets `nosniff`, `X-Frame-Options`, `Cache-Control: private`, `CSP: sandbox` for PDFs.
 - [ ] Path traversal blocked by `realpath` + prefix check + filename regex allowlist.
+- [ ] No `exec`/`shell_exec`/`system`/`passthru`/`proc_open`/`popen`/backticks with a user-influenced binary, flag, or unescaped argument; external-binary calls pin an absolute path, escape every argument (prefer the array form of `proc_open` — no shell), guard against `-`-prefixed argument injection, set a timeout, and check the exit code (§36).
+- [ ] Untrusted media fed to ImageMagick/FFmpeg is constrained (`policy.xml` / `-protocol_whitelist file`) or processed via a library binding instead of the CLI (§36).
 - [ ] Server-side URL fetches validate scheme AND resolved host (reject RFC1918, `169.254.169.254`, `::1`, `fe80::/10`, `fc00::/7`).
 - [ ] No `?return=`/`redirect=` redirect to absolute URL without host check.
 
@@ -1903,6 +1922,7 @@ for "small" changes.**
 
 - [ ] No secret value exposed via `serializeToForum(...)`.
 - [ ] HTML/admin settings exposed via `serializeToForum` pass through a sanitizer cast.
+- [ ] A shipped HTML-sanitizer class is actually wired into the `serializeToForum` cast closure — not left as unreferenced dead code (§21).
 - [ ] `Extend\Settings::default()` keys are prefixed with the extension id (no collisions).
 - [ ] No `app('log')->info($request->getParsedBody())` — sensitive fields stripped first.
 - [ ] Cache keys include `$actor->id` (or guest/admin/member bucket) when the cached value varies by actor.
@@ -3068,6 +3088,157 @@ Phrase the offer roughly like this:
 - Run the §35.14 compliance audit against what's there.
 - Offer to add ONLY the missing items, with a diff preview when possible (`git diff --no-index /dev/null .github/dependabot.yml`).
 - Default to applying 🔴 critical fixes without asking; ask for 🟠 / 🟡 / ⚪.
+
+---
+
+## §36. Shell command execution & external binaries
+
+**CWE-78.** Flarum core never shells out. The moment an extension calls `exec`,
+`shell_exec`, `system`, `passthru`, `proc_open`, `popen`, or backticks, it owns a
+**command-execution surface**. Even when the immediate arguments are escaped, the binary
+path, its flags, the working directory, the environment, and **the content of any file
+passed in** are all part of the attack surface. CVE-2023-40033 (Intervention\Image
+fetched a URL from a user-controlled string) and the ImageTragick class (CVE-2016-3714)
+are the canonical "media tool processed untrusted input" incidents.
+
+### Locate
+
+```bash
+rg -n "exec\\(|shell_exec|proc_open|passthru|system\\(|popen\\(" src/
+rg -n "escapeshellarg|escapeshellcmd" src/
+```
+
+### Red flags
+
+- **`escapeshellcmd` used instead of `escapeshellarg`.** `escapeshellcmd` escapes a whole command string and still lets an attacker inject extra arguments; `escapeshellarg` quotes exactly one argument. Always `escapeshellarg` each argument individually.
+- **Argument injection.** `escapeshellarg` stops shell metacharacters, NOT a value that *is* a valid flag. A user value of `--output=/var/www/public/index.php` is one safe shell token but a dangerous CLI flag. Validate the value, place untrusted values only *after* a `--` separator, or pin them to a non-flag shape (`(int)` cast, allowlist).
+- **Binary resolved via `$PATH`** (`ffmpeg`, `convert`) instead of an absolute, configured path — a poisoned `PATH` or a same-named binary in the CWD hijacks the call.
+- **The binary name, a flag, or a format string comes from request/setting input.** The only thing that may come from input is a *quoted value argument*, and only after validation.
+- **`2>/dev/null` hardcoded** — POSIX-only; under cmd.exe (`exec` on Windows — and this repo develops on Windows) it redirects to a literal `dev\null` path. It also swallows stderr, hiding the real failure. Capture stderr via `proc_open` pipes instead.
+- **No timeout.** `exec` blocks until the child exits. A crafted GIF/video can pin FFmpeg at 100% CPU indefinitely (DoS). Use `proc_open` + a wall-clock deadline, or a `timeout(1)` wrapper.
+- **Exit code unchecked** — always test `$code !== 0` *and* verify the expected output file exists and is non-empty.
+- **Untrusted file content fed to a media tool.** Even with a perfectly escaped command line, ImageMagick follows `MSL`/`MVG`/`HTTPS` directives and FFmpeg's `concat`/`hls` demuxers read `file://`/`http://` from inside a crafted input — SSRF / LFI with no shell involved. Mitigate: an ImageMagick `policy.xml` that disables non-image coders, `-protocol_whitelist file` on FFmpeg, or drop the binary for a library binding (`ext-imagick`, `ext-gd`, `php-ffmpeg`) which exposes a typed API instead of a string.
+
+### Correct shape
+
+```php
+// Pin the binary, pass arguments as an array (no shell → no escaping needed),
+// run under a timeout, check the exit code AND the output.
+$ffmpeg = '/usr/bin/ffmpeg';                          // absolute, not $PATH
+if (! is_executable($ffmpeg)) {
+    throw new RuntimeException('ffmpeg not available');
+}
+
+$descriptors = [1 => ['pipe', 'w'], 2 => ['pipe', 'w']];
+$proc = proc_open(
+    [
+        $ffmpeg,
+        '-protocol_whitelist', 'file',                // block concat/hls SSRF
+        '-i', $src,                                   // $src = server-generated temp path
+        '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+        '-preset', 'fast', '-crf', '28',
+        $out,                                         // $out = server-generated temp path
+    ],
+    $descriptors, $pipes
+);                                                    // array form — no shell involved at all
+
+if (! is_resource($proc)) throw new RuntimeException('ffmpeg failed to start');
+
+$deadline = microtime(true) + 30;                     // hard wall-clock cap
+while (proc_get_status($proc)['running']) {
+    if (microtime(true) > $deadline) {
+        proc_terminate($proc, 9);
+        throw new RuntimeException('ffmpeg timed out');
+    }
+    usleep(50_000);
+}
+$code = proc_close($proc);
+if ($code !== 0 || ! is_file($out) || filesize($out) === 0) {
+    throw new RuntimeException('ffmpeg conversion failed');
+}
+```
+
+The **array form of `proc_open`** (PHP 7.4+) bypasses the shell entirely — there is no
+string to escape, so argument injection via metacharacters is structurally impossible.
+Prefer it over `exec(sprintf(...))` for every new call. If you must keep `exec`:
+`exec(sprintf('%s -i %s %s', escapeshellarg($bin), escapeshellarg($src), escapeshellarg($out)), $o, $code)`
+— every token `escapeshellarg`'d, the binary included, a constant flag set in between.
+
+### Reference (this extension)
+
+[src/Controller/OptimizeImageController.php:231](src/Controller/OptimizeImageController.php#L231)
+and [:261](src/Controller/OptimizeImageController.php#L261) shell out to `ffmpeg` and
+`convert`. They do the hard parts right — admin-only (`assertAdmin()`), SSRF-validated
+input URL, DNS-pinned download, MIME-sniffed content, `escapeshellarg` on every path.
+Remaining hardening, in severity order: (1) the input file is admin-supplied remote
+content fed straight to ImageMagick/FFmpeg → add `-protocol_whitelist file` + an
+ImageMagick `policy.xml`, or move to `ext-imagick`; (2) no timeout → a crafted file
+hangs the worker; (3) `2>/dev/null` is POSIX-only and this repo develops on Windows;
+(4) `ffmpeg`/`convert` resolve via `$PATH` — pin absolute paths or make them a setting.
+Severity is **🟠 medium**, not high: exploitation needs a compromised admin account, but
+the blast radius if reached is RCE-adjacent — treat it as the extension's sharpest edge.
+
+---
+
+## §37. Frontend `Content` injectors (`Extend\Frontend->content()`)
+
+`Extend\Frontend('forum')->content(fn (Document $document, ServerRequestInterface $request) => …)`
+runs **server-side, synchronously, on every full (non-SPA) page load**, before the HTML
+is flushed. It's the right tool for above-the-fold data and `<head>` tags — and a
+recurring source of three bugs: raw-HTML XSS, per-page query cost, and silent
+duplication of an `ApiResource` field.
+
+### Locate
+
+```bash
+rg -n "->content\\(" extend.php
+rg -n "document->head\\[\\]|document->foot\\[\\]" src/
+```
+
+### Red flags
+
+- **`$document->head[] = '...' . $userControlled . '...'`** — the `head`/`foot` arrays are emitted as **raw HTML**; Mithril/Blade escaping does not apply here. Any user-controlled value (username, display name with a nickname extension installed, free-text setting) must be JSON-encoded with `JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT` before interpolation into a `<script>`, or `htmlspecialchars`'d before interpolation into markup. A bare `json_encode($x)` is **not** enough — `</script>` / `</style>` break out of the element.
+- **A query inside a `Content` injector that is also computed by an `ApiResource` field.** The injector runs for the SSR payload; the resource runs for the API response the SPA fetches milliseconds later. Same data, two queries, every page load. Pick one source of truth — either the SSR injector (and have the JS read `window.__x` instead of refetching) or the API field (and accept the first-paint round-trip), not both.
+- **An injector that does work before checking its enable/visibility setting.** It runs on *every* page; an unconditional `User::where(...)->get()` is a per-request cost paid even when the feature is off.
+- **Per-actor data injected without the per-actor check.** `Document` is built for the requesting actor, but it's easy to inject something they shouldn't see (online users who set `discloseOnline = false`, counts of restricted-tag discussions). Re-apply the same visibility filter the API resource would.
+- **Expensive or unbounded work** — no `limit()`, an N+1 over a relation, an external HTTP call — all of it lands on the critical path of first paint.
+
+### Correct shape
+
+```php
+public function __invoke(Document $document, ServerRequestInterface $request): void
+{
+    if (! $this->settings->get('myext.feature_enabled', false)) {
+        $document->head[] = '<script>window.__myextData=[];</script>';   // cheap early-out
+        return;
+    }
+
+    $data = User::select(['id', 'username', 'avatar_url', 'preferences'])
+        ->where('last_seen_at', '>=', Carbon::now()->subMinutes(5))
+        ->limit(50)                                                       // always bounded
+        ->get()
+        ->filter(fn (User $u) => $u->preferences['discloseOnline'] ?? true) // per-actor visibility
+        ->map(fn (User $u) => ['id' => $u->id, 'username' => $u->username])
+        ->values()->toArray();
+
+    // JSON_HEX_* prevents `</script>` / quote break-out from user-controlled fields.
+    $json = json_encode($data,
+        JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES
+        | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT);
+
+    $document->head[] = "<script>window.__myextData={$json};</script>";
+}
+```
+
+### Reference (this extension)
+
+[src/Content/InjectOnlineUsers.php:49](src/Content/InjectOnlineUsers.php#L49) is the
+**correct** `<head>` injection pattern — bounded query, `discloseOnline` filter, and the
+full `JSON_HEX_*` flag set. Copy it. The gap is duplication:
+[src/Api/ForumAttributes.php:62](src/Api/ForumAttributes.php#L62) computes the *same*
+online-user list as an `avocadoOnlineUsers` API attribute, so every forum page runs the
+query twice. Resolve by deleting one side — keep the SSR injector and have the JS read
+`window.__avocadoOnlineUsers`, or keep the API field and drop the injector.
 
 ---
 
