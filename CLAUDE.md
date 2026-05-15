@@ -58,6 +58,13 @@ Base Github: https://github.com/ram0ng1/verified, https://github.com/ram0ng1/avo
 - §39 **Flarum version compatibility** — composer constraint vs API surface (v1.x/v2.x), MySQL-only SQL in migrations, Eloquent vs `ConnectionInterface`
 - §40 **Frontend robustness, TS discipline, CSS targeting** — `JSON.parse` traps, user-visible error UI, DOM scoping, `as any`, `color-mix()`, hardcoded truncation, helper deduplication, unreachable CSS
 - §41 **Logging discipline** — inject PSR-3 `LoggerInterface`; ban `Illuminate\Support\Facades\Log`
+- §42 **Project hygiene & scaffolding completeness** — empty-skeleton smell, `console.log` in dist, stale `extra.*` metadata, missing referenced assets, PHPStan disabled in CI
+- §43 **Composer constraints & dependency contracts** — `flarum/core` version range matches API surface, sister-extension pinning, `require` vs `suggest`, optional integration guards (`class_exists`, `extension_enabled`)
+- §44 **Long-lived process state & PHP global handlers** — `set_error_handler` must chain, static Eloquent properties leak across requests in Octane/queue workers, `resolve()`/`app('foo')` without `bound()` check
+- §45 **Migrations on core tables** — companion-table convention, online-DDL impact on `users`/`discussions`/`posts`/`discussion_user`, never add columns to core
+- §46 **Event listener / blueprint subject-type contracts** — subject must match the type the consumer expects; polymorphic `subject_type`/`subject_id` integrity; recipient filters on `beforeSending`
+- §47 **Admin-controlled execution surfaces** — `createContextualFragment`, settings-as-`<script>`, `style.innerHTML` interpolation, custom-JS/custom-CSS settings panels
+- §48 **Review report output contract** — when finishing a `/review` or `/security-review`, ask before emitting; required fields (timestamp, quality score, vibe-coded score, executive summary, findings table); scoring rubric; verdict thresholds (≥80 approved, ≥75 with concerns, <75 not for production)
 
 ---
 
@@ -1092,6 +1099,7 @@ Strip CR/LF (`\r\n`) defensively even if your HTTP layer claims to handle it.
 
 ```bash
 rg -n "Http\\\\Client|GuzzleHttp\\\\Client|curl_init|file_get_contents\\(" src/
+rg -n "CURLOPT_SSL_VERIFYPEER|CURLOPT_SSL_VERIFYHOST|'verify'\\s*=>\\s*false|verify_peer'?\\s*=>\\s*false" src/
 ```
 
 - URL fetched from user input MUST validate scheme AND resolved host:
@@ -1100,6 +1108,119 @@ rg -n "Http\\\\Client|GuzzleHttp\\\\Client|curl_init|file_get_contents\\(" src/
   - Resolve DNS → IP, re-check the IP. Defeat DNS rebinding by pinning the resolved IP for the actual request.
 - Disable `allow_url_fopen` if you pass user URLs to image libraries. Intervention\Image
   `make($url)` is a known SSRF vector (CVE-2023-40033 in Flarum core).
+
+#### TLS verification — never disable
+
+`CURLOPT_SSL_VERIFYPEER => false`, `CURLOPT_SSL_VERIFYHOST => 0`, or Guzzle
+`'verify' => false` defeats certificate validation, opening every server-side fetch to
+a network-positioned attacker (rogue WiFi, compromised egress proxy, malicious upstream
+CDN). The "self-signed staging server" excuse should be solved with `'verify' =>
+'/path/to/staging-ca-bundle.pem'`, not by disabling verification globally. Disabled
+verification on a production extension is **🔴 critical** — promote to a release
+blocker regardless of how minor the surrounding feature seems.
+
+#### Response size cap — server-side
+
+The client-side advice in the next subsection (streamed size cap) applies even harder
+server-side: a malicious URL can serve a 5 GB body and OOM the worker. Cap with a
+streaming buffer:
+
+```php
+// Guzzle — abort after N bytes
+$client = new \GuzzleHttp\Client();
+$body = '';
+$maxBytes = 5 * 1024 * 1024;                            // 5 MB
+$response = $client->request('GET', $url, [
+    'stream'  => true,
+    'timeout' => 10,
+    'connect_timeout' => 5,
+    'verify'  => true,
+]);
+$stream = $response->getBody();
+while (! $stream->eof()) {
+    $chunk = $stream->read(8192);
+    $body .= $chunk;
+    if (strlen($body) > $maxBytes) {
+        $stream->close();
+        throw new \RuntimeException('Response too large');
+    }
+}
+```
+
+For cURL: use `CURLOPT_PROGRESSFUNCTION` to abort when `$dlnow > $maxBytes` by
+returning non-zero. `CURLOPT_NOPROGRESS` must be `false` to enable the callback.
+
+#### URL normalization — case, encoding, IDN
+
+A naive `parse_url($url)['host']` returns the host as the user supplied it. An
+attacker can defeat a blocklist by varying:
+- **Case**: `Localhost`, `LOCALHOST` — compare on `strtolower($host)` only after
+  normalizing punycode.
+- **Percent-encoding**: `loc%61lhost` — decode once with `rawurldecode` before checking.
+- **IDN / punycode**: `xn--<lookalike>` decodes to a Unicode lookalike for an internal
+  hostname. Use `idn_to_ascii($host, IDNA_DEFAULT, INTL_IDNA_VARIANT_UTS46)` to
+  canonicalize, then compare.
+- **Trailing dot**: `localhost.` resolves to `localhost` on most resolvers but bypasses
+  a string-equality block. Strip the trailing dot.
+- **IPv6 brackets**: `[::1]` vs `::1` vs `0:0:0:0:0:0:0:1` — always parse with
+  `inet_pton` and compare on the binary form.
+
+```php
+$host = parse_url($url, PHP_URL_HOST);
+$host = rtrim(strtolower(rawurldecode((string) $host)), '.');
+if (function_exists('idn_to_ascii')) {
+    $host = idn_to_ascii($host, IDNA_DEFAULT, INTL_IDNA_VARIANT_UTS46) ?: $host;
+}
+$resolved = gethostbynamel($host) ?: [];                // expand to all A records
+foreach ($resolved as $ip) {
+    if (! filter_var($ip, FILTER_VALIDATE_IP,
+        FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE)) {
+        throw new \RuntimeException('Resolved to a blocked range');
+    }
+}
+```
+
+Then **use the resolved IP as the connection target** (cURL `CURLOPT_RESOLVE`,
+Guzzle `curl.options.CURLOPT_RESOLVE`) while keeping `Host: $host` in the request
+header. This defeats DNS rebinding — the attacker can't have the second resolution
+point at `127.0.0.1` because you never resolve again.
+
+#### Authentication and rate limiting on outbound-fetch endpoints
+
+Any endpoint that fetches a user-supplied URL on the server must:
+1. Require authentication (`assertRegistered()` minimum; `assertCan('myext.fetchUrl')`
+   if the feature is sensitive).
+2. Apply a per-actor throttler (§18) — without one, an authenticated user can pin a
+   worker on `Sleep` URLs and OOM the host on response-size limits.
+3. NOT be exempted from CSRF (§16) — token-authenticated callers bypass CSRF by
+   design, but a session-authenticated cross-site form post should be rejected.
+
+A finding of "no authentication or rate limiting on outbound-fetch endpoints" is
+**🔴 critical**: unauthenticated SSRF on a Flarum forum gives an attacker the forum's
+egress IP to probe internal infrastructure, cloud metadata services
+(`169.254.169.254`), and any service that allowlists the forum's IP.
+
+#### Cache keys — scheme matters
+
+A link-preview cache keyed by hostname/path but not scheme collides between
+`http://example.com/x` and `https://example.com/x`. The plaintext response wins (or
+the first to resolve wins), and the next visitor reading the HTTPS link gets
+attacker-controlled plaintext content. Always include scheme + full normalized URL in
+the cache key — see §24 for the cache-key shape.
+
+```php
+$key = 'myext.linkpreview.' . hash('sha256',
+    $scheme . '://' . $host . $path . '?' . ($query ?? ''));
+```
+
+#### Synchronous DNS / fetch in the request path
+
+Even after every SSRF mitigation, a `gethostbynamel()` or HTTP request in the
+synchronous request thread blocks the worker for the duration. On a slow or
+unreachable target, that's seconds-to-the-timeout per request — a DoS vector against
+your own forum, no attacker needed. Push uncached fetches to a queued job
+(`Extend\ServiceProvider` + a `Bus` dispatch) and return a "pending" placeholder. The
+job runs in a queue worker, not a web worker — outage doesn't cascade to first paint.
 
 ### Client-side (`fetch()` in browser)
 
@@ -1782,19 +1903,260 @@ class SecurityHeadersMiddleware implements MiddlewareInterface
 (new Extend\Middleware('forum'))->add(SecurityHeadersMiddleware::class);
 ```
 
-### GDPR / data export integration
+### GDPR / data export integration — full integration guide
 
-If `flarum/gdpr` is installed and your extension stores PII (user-controlled data
-beyond the standard profile fields), register a UserData type:
+If your extension persists ANY user-controlled data — uploads, drafts, preferences not
+covered by core, audit rows, foreign-system identifiers, IP addresses, free-text
+moderator-visible notes that the user authored — and `flarum/gdpr` is installed, you
+**must** register a data type that handles **all three** lifecycle phases: export,
+anonymize, delete. Missing any one is a GDPR violation:
+
+| Phase | Right (GDPR article) | Failure mode |
+|---|---|---|
+| `export()` | Right of access (Art. 15) | User can't obtain their data |
+| `anonymize()` | Right to rectification / restriction (Art. 16, 18) | User's identity persists in your tables after the core anonymization sweep |
+| `delete()` | Right to erasure (Art. 17) | User's rows survive account deletion as orphans |
+
+#### Composer wiring — `require` vs `suggest`
+
+**Never `composer require flarum/gdpr`** from your extension `composer.json`. That makes
+GDPR a hard install dependency on every forum, including those that don't care.
+Instead:
+
+```json
+{
+  "suggest": {
+    "flarum/gdpr": "Required for data-export and erasure integration (^2.0)."
+  }
+}
+```
+
+…and **gate the wiring in `extend.php`** so the extension boots cleanly with or without
+GDPR present:
+
+```php
+// extend.php
+use Flarum\Extend;
+
+$extenders = [
+    // ... your normal extenders ...
+];
+
+if (class_exists(\Flarum\Gdpr\Extend\UserData::class)) {
+    $extenders[] = (new \Flarum\Gdpr\Extend\UserData())
+        ->addType(\Vendor\MyExt\Gdpr\MyData::class)
+        ->removeUserColumns(['my_legacy_pii_column']);   // if you also wrote to users
+}
+
+return $extenders;
+```
+
+`class_exists` is the right gate (not `app(ExtensionManager::class)->isEnabled('flarum-gdpr')`)
+— composer autoloading is finalized by the time `extend.php` is read, but Flarum's
+extension manager state may not be. The `class_exists` check is cheap and
+synchronously-decidable. A review finding flagging "GDPR Erasing event dependency not
+declared" is satisfied by this gate plus the `composer.json` `suggest` entry.
+
+#### Implementing the data type
+
+The cleanest path is **extending `Flarum\Gdpr\Data\Type`** rather than implementing
+`Flarum\Gdpr\Contracts\DataType` from scratch — the abstract base wires translator
+keys, the disk factory, and the user/erasureRequest constructor for you:
+
+```php
+namespace Vendor\MyExt\Gdpr;
+
+use Flarum\Gdpr\Data\Type;
+use Illuminate\Support\Arr;
+use Vendor\MyExt\Models\AuditEntry;
+
+class MyData extends Type
+{
+    // --- Identity ----------------------------------------------------------
+
+    public static function dataType(): string
+    {
+        return 'AuditEntries';                          // appears in the export UI
+    }
+
+    /**
+     * Keys WITHIN this data type's serialized export/event payloads that contain PII.
+     * Used by the GDPR module to redact fields when event payloads are forwarded
+     * to a message broker. Declare every PII column you serialize.
+     */
+    public static function piiFields(): array
+    {
+        return ['ip_address', 'user_agent', 'free_text_note'];
+    }
+
+    // --- Export (Right of access, Art. 15) ---------------------------------
+
+    public function export(): ?array
+    {
+        $rows = [];
+
+        AuditEntry::query()
+            ->where('user_id', $this->user->id)
+            ->whereVisibleTo($this->user)               // §5 — never leak others' rows
+            ->orderBy('created_at', 'asc')
+            ->each(function (AuditEntry $entry) use (&$rows) {
+                $rows[] = [
+                    "audit/entry-{$entry->id}.json" => $this->encodeForExport(
+                        Arr::only($entry->toArray(), [
+                            'action', 'created_at',
+                            'ip_address',                // user's own data — fine
+                            'free_text_note',            // user authored it — fine
+                            // NEVER include moderator_note: that belongs to the moderator
+                        ])
+                    ),
+                ];
+            });
+
+        return $rows ?: null;                           // null = nothing to export, skip
+    }
+
+    // --- Anonymize (Right to restriction / Art. 18) ------------------------
+
+    public function anonymize(): void
+    {
+        // The user row itself is renamed by Flarum\Gdpr\Data\User AFTER every other
+        // type. Your job is to scrub THIS extension's PII so the user's audit trail
+        // can no longer be traced back to them, while keeping the audit row's
+        // existence (for forum integrity, moderation history, etc.).
+        AuditEntry::query()
+            ->where('user_id', $this->user->id)
+            ->update([
+                'ip_address'     => null,
+                'user_agent'     => null,
+                'free_text_note' => null,
+            ]);
+    }
+
+    // --- Delete (Right to erasure / Art. 17) -------------------------------
+
+    public function delete(): void
+    {
+        // True deletion. If you have FK cascades configured in your migration
+        // (§26), this might already happen via the user-row delete — but
+        // declaring it here is defense in depth in case the FK is ever dropped.
+        AuditEntry::query()->where('user_id', $this->user->id)->delete();
+    }
+}
+```
+
+#### Translator keys (mandatory)
+
+`Flarum\Gdpr\Data\Type` looks up its description strings as
+`flarum-gdpr.lib.data.<lowercased-dataType()>.{export,anonymize,delete}_description`.
+**These keys must exist in your locale or the admin UI shows raw translation keys.**
+
+```yaml
+# locale/en.yml
+flarum-gdpr:
+  lib:
+    data:
+      auditentries:                              # lowercase of dataType()
+        export_description: "Every audit log entry generated by your account, including the IP and free-text notes."
+        anonymize_description: "IP address, user-agent, and free-text notes will be cleared on each audit entry. The entry itself is retained for forum integrity."
+        delete_description: "Every audit entry attributed to your account is permanently deleted."
+```
+
+If your data type's `anonymize` and `delete` produce the same result, follow the
+`Discussions` pattern — override `anonymizeDescription()` to call `deleteDescription()`
+and have one locale key.
+
+#### `removeUserColumns` — opting columns out of the `Data\User` export
+
+If your extension added columns directly to the `users` table (you shouldn't — see §45
+— but if you inherited an extension that did), those columns are picked up by
+`Flarum\Gdpr\Data\User::export()` automatically. Use `removeUserColumns` to suppress
+columns the user shouldn't see in their own export (e.g., internal moderator-only flags
+that happen to live on the user row):
 
 ```php
 (new \Flarum\Gdpr\Extend\UserData())
-    ->addType(MyExtensionUserData::class);
+    ->addType(MyData::class)
+    ->removeUserColumns(['my_internal_flag', 'my_moderator_score']);
 ```
 
-`MyExtensionUserData::piiFields()` must return the list of stored PII columns. Missing
-registration = incomplete data export = user can't access their own data (GDPR right of
-access violation).
+For ones that ARE user-owned, leave them in the export but list them in `piiFields()`
+on a dedicated type so they're correctly redacted in serialized event payloads.
+
+#### Type ordering — `Data\User` runs LAST, by design
+
+`DataProcessor::addType` always re-inserts `Flarum\Gdpr\Data\User::class` at the end of
+the type list. The reason: the User type **renames** the user (`username = "Anonymous{id}"`),
+nulls the email, and clears preferences. Every preceding type's `anonymize()` runs
+with the **original** username/email still on `$this->user`, which is usually what you
+want (e.g., emailing the user a confirmation BEFORE rename). Don't rely on a specific
+ordering between your type and another third-party type — order between non-User types
+is registration order, and the next ext install can shuffle it.
+
+#### Reservedabilities — keeping specific actions valid on anonymized users
+
+Once a user is anonymized, `Flarum\Gdpr\Access\UserPolicy::can` **denies every ability**
+against the anonymized user by default (vendor/flarum/gdpr/src/Access/UserPolicy.php:27).
+Core preserves only `delete` via the `gdpr.user.reservedAbilities` container binding.
+If your extension defines abilities that must still work post-anonymization (e.g.,
+`moderator.canReadAuditLog` so audit history stays viewable), extend the binding from
+**a service provider** registered via `Extend\ServiceProvider`:
+
+```php
+class MyExtGdprIntegrationProvider extends AbstractServiceProvider
+{
+    public function register(): void
+    {
+        if (! $this->container->bound('gdpr.user.reservedAbilities')) {
+            return;                                    // gdpr not installed, no-op
+        }
+        $this->container->extend('gdpr.user.reservedAbilities', function (array $abilities) {
+            return array_merge($abilities, ['myext.readAuditTrail']);
+        });
+    }
+}
+```
+
+#### `Erasing` / `Erased` events for chained extension cleanup
+
+For work that doesn't fit a `DataType` (cache invalidation, queue tear-down, external
+SaaS notification), listen to `Flarum\Gdpr\Events\Erasing` (fires before the
+DataProcessor pipeline) and `Flarum\Gdpr\Events\Erased` (fires after the user row has
+been deleted or renamed):
+
+```php
+// extend.php — wrapped in class_exists gate as above
+$extenders[] = (new Extend\Event())
+    ->listen(\Flarum\Gdpr\Events\Erased::class, OnUserErased::class);
+```
+
+Note the **`Erasing` event carries an `ErasureRequest`**, not a `User` — the user model
+on the request is unanonymized at this point. The **`Erased` event carries the User
+plus the pre-anonymization username, email, and mode** (anonymization vs deletion) as
+separate scalar properties. Read those, don't re-read `$user->username` — by the time
+your listener runs, it's already `Anonymous{id}`.
+
+#### Capability-URL caveat for downstream exports
+
+If your data type produces a downloadable artifact distinct from the main ZIP (rare,
+but happens for very large datasets), DO NOT roll your own download endpoint that
+authenticates "via the random URL". Reuse the GDPR `Export` model so it inherits the
+existing `ExportController` policy (capability-URL model — see §13.8) or write a
+`ConfirmErasureController`-style endpoint that actually verifies the actor.
+
+#### Final GDPR checklist for the extension
+
+- [ ] `composer.json` lists `flarum/gdpr` under `suggest`, not `require`.
+- [ ] `extend.php` wraps the `UserData` extender in `class_exists(\Flarum\Gdpr\Extend\UserData::class)`.
+- [ ] Data type extends `Flarum\Gdpr\Data\Type` (or implements `DataType` with the full eight-method contract).
+- [ ] `piiFields()` lists EVERY serialized key that contains PII (not just columns — also array keys produced inside `export()`).
+- [ ] `export()` uses `->where('user_id', $this->user->id)` AND `->whereVisibleTo($this->user)` AND `->where('is_private', false)` where the model has those columns.
+- [ ] `export()` never includes moderator-authored notes about the user.
+- [ ] `anonymize()` clears every PII column listed in `piiFields()`.
+- [ ] `delete()` actually deletes (FK cascade is not enough — declare it explicitly).
+- [ ] Locale keys exist for `export_description`, `anonymize_description`, `delete_description`.
+- [ ] If you preserved any ability post-anonymization, it's wired via `$container->extend('gdpr.user.reservedAbilities', ...)` inside a `bound()` check.
+- [ ] Listeners for `Erased` read the pre-anonymization username/email from the event's scalar properties, never from `$user`.
+- [ ] Capability URLs (random-filename downloads) reuse `Flarum\Gdpr\Models\Export` rather than rolling a parallel mechanism.
 
 Don't over-disclose: never include moderator-only notes ABOUT the user in their data
 export — those belong to the moderator, not the user.
@@ -1987,6 +2349,55 @@ for "small" changes.**
 - [ ] If a setting/column was removed, the migration deletes its persisted rows.
 - [ ] Locale entries added for every visible string AND every custom permission ability.
 - [ ] No `// removed`/`// legacy` comments left on dead code, no `.less` block for a feature whose JS/PHP doesn't ship.
+- [ ] No `Schema::table('users'/'discussions'/'posts'/'discussion_user'/'groups'/'tags')` — all extension data is on a companion table with a FK back to the core row (§45).
+
+### Project hygiene & scaffolding (§42)
+
+- [ ] `extend.php` delivers concrete, non-skeleton functionality (routes, models, resources, schema fields).
+- [ ] No `console.log` / `console.debug` / `debugger;` in `js/dist/{forum,admin}.js`.
+- [ ] `composer.json` `extra.flarum-extension.title/category/icon` are the extension's real values, not `flagrow.*` / `reflar.*` / placeholder text.
+- [ ] Every path referenced from `extend.php` (`__DIR__.'/locale'`, `__DIR__.'/js/dist/...'`, `__DIR__.'/resources/...'`) exists and is non-empty.
+- [ ] `locale/en.yml` is non-empty and contains a key per visible translator slug.
+- [ ] PHPStan (and any other lint step) in CI is either blocking or removed — no `continue-on-error: true` on quality gates.
+
+### Composer & integration contracts (§43)
+
+- [ ] `"flarum/core"` constraint matches the API surface actually imported in `src/` (§39.1).
+- [ ] No `"flarum/<sister>": "*"` unbounded constraint.
+- [ ] Optional integrations are in `suggest`, not `require`; their `extend.php` wiring is wrapped in `class_exists(...)`.
+- [ ] Container `bound('<key>')` check precedes any `resolve(...)` / `$container->extend('<key>', ...)` for an optional binding (§44.3).
+- [ ] `"php": "^8.2"` (or stricter) constraint matches the CI matrix and Flarum 2.x baseline.
+
+### Long-lived process safety (§44)
+
+- [ ] `set_error_handler` / `set_exception_handler` calls capture the previous handler and call it from the new one.
+- [ ] No `protected static $foo` cache on Eloquent models holding actor- or request-scoped data.
+- [ ] No `resolve('key')` / `app('key')` on an extension-provided key without `$container->bound('key')` first.
+- [ ] Singletons registered via `Extend\ServiceProvider` never hold request-scoped state.
+
+### Polymorphic subjects & notifications (§46)
+
+- [ ] Every `Blueprint` constructor uses typed parameters; the typed model is the one returned by `getSubject()`.
+- [ ] `getType()` string is declared as a class constant; the frontend reads it via `app.forum.attribute(...)` or a constant — not a duplicated literal.
+- [ ] `beforeSending` recipient filter re-checks `$user->can('view', $blueprint->subject)` for any blueprint whose subject has visibility rules.
+- [ ] `getData()` returns IDs and primitive scalars only — never raw user content.
+- [ ] Event listeners that wrap another extension's event read pre-anonymization scalars from the event properties, not from `$user->username` after the fact.
+
+### Admin-controlled execution surfaces (§47)
+
+- [ ] No `createContextualFragment` / `new Function` / `eval` consuming an admin setting value.
+- [ ] No `innerHTML = settingValue` outside a sanitized pipeline; `style.innerHTML` interpolation is replaced with `style.textContent` + regex-validated values.
+- [ ] Shipped HTML-sanitizer classes are wired into the `serializeToForum` cast closure — not orphaned in `src/Support/`.
+- [ ] Custom-JS/HTML settings expose a visible warning banner in the admin UI and require a dedicated ability (not just `administrate`).
+
+### GDPR integration (§30, when `flarum/gdpr` is involved)
+
+- [ ] `flarum/gdpr` is in `suggest`, not `require` (unless the extension is genuinely useless without it).
+- [ ] `Extend\UserData` wiring is wrapped in `class_exists(\Flarum\Gdpr\Extend\UserData::class)`.
+- [ ] Data type extends `Flarum\Gdpr\Data\Type` and implements `dataType()`, `piiFields()`, `export()`, `anonymize()`, `delete()`.
+- [ ] `export()` filters by `user_id` AND `whereVisibleTo($user)` AND, where applicable, `is_private = false`.
+- [ ] Locale keys `flarum-gdpr.lib.data.<lowercased-type>.{export,anonymize,delete}_description` exist.
+- [ ] `gdpr.user.reservedAbilities` extension is wrapped in `$container->bound(...)`.
 
 ### Build & lint
 
@@ -3820,6 +4231,1203 @@ gets the same container resolution — same shape.
 
 Re-read §23 for **what** to log (don't log request bodies, headers, tokens). This
 section is about **how** to obtain the logger.
+
+---
+
+## §42. Project hygiene & scaffolding completeness
+
+The single most common rejection reason in code review is "this extension does almost
+nothing" — empty scaffolding, `console.log` debug calls in the shipped bundle, stale
+boilerplate metadata from a template, and `.less`/`locale` files referenced by
+`extend.php` that don't exist on disk. None of these are vulnerabilities. Together
+they tank the quality score and signal "vibe-coded, not reviewed" to reviewers,
+which is enough to fail listing.
+
+### 42.1 The empty-skeleton smell
+
+Symptoms reviewers flag:
+- `extend.php` returns `[]` or only locale/frontend extenders — no routes, no models, no resources.
+- `js/src/forum/index.{js,ts}` body is `app.initializers.add('myext', () => { console.log('myext booted'); });`.
+- `src/` directory exists but contains only the namespace declaration in one file with no class body, or a `Stub.php` from the `flarum/cli` template.
+- `README.md` advertises features the code doesn't implement.
+
+**Rule**: if a forum operator installs the extension today, what concrete thing
+changes for them? If the answer is "nothing visible", the extension is not ready to
+list. Either implement the advertised features OR mark the package
+`"abandoned": true` in `composer.json` until it is.
+
+```bash
+# Find debug-only entry points
+rg -n "console\\.log\\(|console\\.debug\\(|console\\.warn\\(" js/src/ js/dist/
+rg -n "console\\.log\\(" js/dist/ --type js          # the BUILT bundle, not just src
+
+# Find empty PHP files (one short class with no body)
+find src -name '*.php' -size -2k -print0 | xargs -0 -I {} sh -c 'echo "== {} =="; wc -l "{}"'
+```
+
+`console.log` in `js/dist/` ships to every visitor's browser console. It's harmless
+but reviewers grade it as "production hygiene: 0/3". Strip with webpack
+`TerserPlugin` `drop_console: true` in production mode, or guard with
+`if (process.env.NODE_ENV !== 'production') console.log(...)`.
+
+### 42.2 Stale boilerplate from `flarum/cli`
+
+`flarum/cli` generates a `composer.json` with placeholder values in `extra.flarum-extension`,
+sometimes carrying vendor names from older forks (`flagrow.discuss`, `reflar.foo`,
+`fof.bar`). Reviewers grep for these and flag any extension still carrying them.
+
+```bash
+# Stale vendors and template placeholders
+rg -n "flagrow|reflar|fof\\.|YOUR_VENDOR|YOUR_EXTENSION|TODO|FIXME|XXX" composer.json
+rg -n "Acme|Vendor|MyVendor|ChangeMe" composer.json src/ js/src/
+```
+
+The `extra.flarum-extension` block must list **only** your extension's title, icon
+config, and category, with values that actually describe the extension. Empty or
+template values are read by `flarum/extension-manager` and surface in the admin UI as
+"Untitled" or as the wrong icon.
+
+### 42.3 Referenced assets that don't exist
+
+`extend.php` lines like `new Extend\Locales(__DIR__.'/locale')` or
+`(new Extend\Frontend('forum'))->js(__DIR__.'/js/dist/forum.js')->css(...)` are read
+at boot. Missing files don't error loudly — they just don't ship the asset, and the
+feature silently doesn't render.
+
+```bash
+# Verify every path referenced from extend.php actually exists
+rg -n "__DIR__\\.\\s*'/[^']+'" extend.php
+# For each path, test:
+test -e "<extracted-path>" || echo "MISSING: <extracted-path>"
+
+# Locale files must contain non-empty YAML
+for f in locale/*.yml; do
+    [ -s "$f" ] || echo "EMPTY LOCALE: $f"
+done
+```
+
+Empty `locale/en.yml` is the silent killer: every translator key falls back to its
+literal slug, the admin UI shows `myext.settings.label` instead of "My setting", and
+the extension looks broken without any error message.
+
+### 42.4 PHPStan / type-check disabled in CI
+
+A `.github/workflows/ci.yml` block that runs PHPStan but exits 0 on failure (or
+prints "skipping PHPStan" because the dev dependency is missing) gives a false green
+check. Reviewers grade this as a `technical debt` finding because every type bug
+silently ships.
+
+```bash
+rg -n "phpstan|psalm" composer.json .github/
+rg -n "continue-on-error:\\s*true|exit 0" .github/workflows/
+```
+
+Either:
+- Wire PHPStan **as a blocking step** (`composer require --dev phpstan/phpstan:^1 flarum/phpstan-stub`, then `vendor/bin/phpstan analyse --level=max src/ extend.php`), OR
+- Don't ship a PHPStan step at all. A "disabled with a printed warning" step is worse than no step.
+
+The same applies to TypeScript's `tsc --noEmit`, ESLint, Prettier, and `composer
+audit` — make them blocking or remove them.
+
+### 42.5 Built artifacts in `js/dist/`
+
+`js/dist/{forum,admin}.js` is checked into git so that `composer require` works
+without a Node toolchain on the production host. The artifact MUST:
+- Be regenerated and committed in the SAME commit as the JS source change. A
+  `composer.json` version bump that ships outdated `dist/` is a regression — users get
+  yesterday's UI with today's backend.
+- Be a production build (`webpack --mode production`), not a development build with
+  source maps and debug shims.
+- NOT contain `console.log`, `debugger;`, or sourcemap-inline base64 in the bundle.
+
+### 42.6 Common quality-score deductions reviewers apply
+
+| Symptom | Severity | Section to read |
+|---|---|---|
+| Empty `extend.php` or `src/` for an extension claiming features | High (production risk) | §42.1 |
+| `console.log` in `js/dist/` | Medium (dead code) | §42.1 |
+| Stale `flagrow.*` / `reflar.*` / placeholder `extra.flarum-extension` | Medium (technical debt) | §42.2 |
+| Referenced locale/asset directory missing | Medium (dead code) | §42.3 |
+| PHPStan disabled with `continue-on-error: true` | Medium (technical debt) | §42.4 |
+| Outdated `js/dist/` not regenerated for the JS change | High (production risk) | §42.5 |
+| Imports of components never rendered | Low (dead code) | §31 |
+| Translator key typo silently breaks notification type | Medium (dead code) | §46.2 |
+
+---
+
+## §43. Composer constraints & dependency contracts
+
+The `composer.json` of an extension is a public contract: what version of Flarum core
+the code runs on, which optional integrations exist, and how the package interacts
+with the host forum's lockfile. Reviewers flag mismatches as `conventions` findings,
+but the underlying impact is real — too-loose constraints break installs in
+production, too-tight ones lock operators into manual updates.
+
+### 43.1 `flarum/core` constraint must match the API surface in `src/`
+
+§39.1 covered the rough rule; this section is the operational checklist.
+
+```bash
+# What API surface does the code use?
+rg -n "use Flarum\\\\(Api\\\\(Resource|Schema|Endpoint|Context)|Forum\\\\Controller\\\\FrontendController)" src/ extend.php
+
+# What does composer.json claim?
+rg -n "\"flarum/core\"" composer.json
+```
+
+Decision matrix:
+
+| Imports include `Flarum\Api\(Resource|Schema|Endpoint|Context)` | Constraint | Why |
+|---|---|---|
+| Yes (any of them) | `"flarum/core": "^2.0"` | v1 doesn't have these namespaces; install crashes on enable |
+| No, only legacy `AbstractSerializer`/`AbstractController` | `"flarum/core": "^1.0"` | v2 supports v1-style for now, but consider migration |
+| Neither (only `Extend\Routes`/`Extend\Settings`/translator/Eloquent) | `"flarum/core": "^1.0 \|\| ^2.0"` is **acceptable but rare** | Almost every real extension touches a Resource or Endpoint |
+
+**Anti-pattern**: shipping `"flarum/core": "^1.0 || ^2.0"` for an extension whose
+`src/` is full of v2-only classes. The composer install succeeds on a v1 forum; the
+extension activation triggers a fatal "Class not found". The operator sees a
+white-screened admin panel.
+
+### 43.2 `flarum-extension.json` (legacy) and `extra.flarum-extension` must agree
+
+`composer.json` carries the canonical `extra.flarum-extension` block:
+
+```json
+{
+  "extra": {
+    "flarum-extension": {
+      "title": "My Extension",
+      "category": "feature",
+      "icon": { "name": "fas fa-star", "backgroundColor": "#222", "color": "#fff" }
+    }
+  }
+}
+```
+
+The title appears in the admin UI; the icon renders in the extension card; the
+category groups extensions. Boilerplate carryover from `flarum/cli` (title:
+"Acme Extension", category: `feature` when actually a `theme`) is what's flagged as
+"stale metadata". Walk the file and replace every placeholder.
+
+### 43.3 Sister-extension version pinning
+
+When your extension integrates with another extension (suggests, requires, or events
+it listens for), constrain the version explicitly. `"flarum/tags": "*"` accepts any
+release including a future v3 with breaking API changes; the next forum operator
+upgrade silently breaks your integration.
+
+```json
+{
+  "require": {
+    "php": "^8.2",
+    "flarum/core": "^2.0",
+    "flarum/tags": "^2.0"             // version-bounded, not "*"
+  },
+  "suggest": {
+    "flarum/gdpr": "Required for data export/erasure integration (^2.0).",
+    "flarum/likes": "Adds bounty rewards on liked posts (^2.0)."
+  }
+}
+```
+
+`*` on a `require` constraint is **🟡 low** — it works today but creates a future
+support burden. Reviewers flag it.
+
+### 43.4 `require` vs `suggest` — the integration gate
+
+If your extension's core feature works without extension X, list X under `suggest`
+and wrap its wiring in `class_exists`/container `bound()` checks. If X is mandatory,
+list it under `require` and let composer enforce it.
+
+Operational rule: **`require` should only contain things the extension cannot boot
+without.** A "nice to have" integration that improves UX when present but doesn't
+break when absent goes in `suggest`.
+
+```php
+// extend.php — class_exists gate for suggested integrations
+$extenders = [
+    // ... mandatory wiring ...
+];
+
+if (class_exists(\Flarum\Gdpr\Extend\UserData::class)) {
+    $extenders[] = (new \Flarum\Gdpr\Extend\UserData())->addType(MyData::class);
+}
+
+if (class_exists(\Flarum\Tags\Tag::class)) {
+    $extenders[] = (new Extend\Model(\Flarum\Tags\Tag::class))->hasMany(...);
+}
+```
+
+A review finding "GDPR Erasing event dependency not declared in composer.json"
+typically means: the extension listens to `Flarum\Gdpr\Events\Erased` in `extend.php`
+**without a class_exists guard AND without a composer require**. Pick one — guard
+the listener if GDPR is optional, or require GDPR if it's mandatory.
+
+### 43.5 PHP version constraint
+
+`"php": "^8.2"` is the current Flarum 2.x baseline. Test against the matrix in §35.2
+(8.2/8.3/8.4). Don't claim `"^8.0"` — Flarum 2 relies on 8.1+ features (readonly,
+first-class callable syntax, enums), and your code will fail-fast on 8.0 hosts.
+
+### 43.6 Quick grep audit
+
+```bash
+# Constraint vs API surface
+rg -n "\"flarum/core\":\\s*\"[^\"]+\"" composer.json
+rg -n "use Flarum\\\\Api\\\\(Resource|Schema|Endpoint)" src/
+
+# Unbounded sister-extension requires
+rg -n "\"flarum/[^\"]+\":\\s*\"\\*\"" composer.json
+
+# Listeners or extenders for a class that isn't required or guarded
+rg -n "\\\\Gdpr\\\\Events\\\\|\\\\Tags\\\\Tag::|\\\\Subscriptions\\\\" extend.php src/
+# Cross-reference each hit with composer.json require/suggest and class_exists guards
+```
+
+---
+
+## §44. Long-lived process state & PHP global handlers
+
+The classic mod_php / php-fpm execution model is **single-shot**: every request gets a
+fresh PHP process, every global resets, every static is empty. Flarum extensions are
+written against this assumption. The model breaks in:
+
+- **Queue workers** — `php flarum queue:work` keeps one PHP process alive across
+  thousands of jobs.
+- **Scheduled-command processes** — long-running `php flarum schedule:work`.
+- **FrankenPHP / RoadRunner / Swoole / Octane** — increasingly common production
+  hosting, one process per worker, sometimes for hours.
+
+In these contexts, **static properties, container singletons, and global PHP error
+handlers persist across requests/jobs**. Code that relies on "fresh process" semantics
+either leaks data between actors or breaks subsequent requests entirely.
+
+### 44.1 `set_error_handler` MUST chain previously-registered handlers
+
+`set_error_handler` returns the **previous** handler. Sentry, Bugsnag, Flarum's own
+`ErrorHandler` middleware, the Whoops integration — all of them call
+`set_error_handler` during boot. If your extension overrides it without preserving
+the chain, every downstream handler stops receiving errors.
+
+```php
+// BAD — replaces every previously-registered handler
+set_error_handler(function ($severity, $message, $file, $line) {
+    MyReporter::report($message);
+});
+
+// GOOD — chain explicitly
+$previous = set_error_handler(function ($severity, $message, $file, $line) use (&$previous) {
+    MyReporter::report($message);
+    if (is_callable($previous)) {
+        return $previous($severity, $message, $file, $line);
+    }
+    return false;                                       // false = continue to PHP default
+});
+```
+
+`set_exception_handler` and `register_shutdown_function` have the same chaining
+contract:
+- `set_exception_handler` returns the previous, call it from yours.
+- `register_shutdown_function` does NOT replace; multiple shutdowns are queued and
+  called in registration order. Don't try to "unregister" by overwriting.
+
+### 44.2 Static properties on Eloquent models
+
+A static cache on an Eloquent class that's `protected static array $cache = []` is
+shared across every request handled by the same worker. In php-fpm: never matters. In
+queue worker: cache from job N is visible to job N+1, including any actor-specific
+state. The example reviewers flag most often is "user-context attached to a query
+scope via static":
+
+```php
+// BAD — leaks across actors in long-lived processes
+class MyModel extends AbstractModel {
+    protected static ?User $contextActor = null;
+    public static function forActor(User $actor): self {
+        self::$contextActor = $actor;
+        return new self();
+    }
+}
+
+// GOOD — pass actor through the call chain, never static
+class MyModel extends AbstractModel {
+    public function scopeForActor(Builder $query, User $actor): Builder {
+        return $query->where('owner_id', $actor->id);
+    }
+}
+```
+
+The same rule applies to query-result caches, permission caches, and "compiled
+config" caches: bind them to a per-actor key (§24) or flush them between jobs via
+the queue's `JobProcessed` event.
+
+```bash
+rg -n "protected static (\\\$|array|?\\??)" src/         # static properties
+rg -n "private static (\\\$|array|?\\??)" src/
+rg -n "self::\\\$|static::\\\$" src/                      # static reads/writes
+```
+
+`flarum/tags` uses a `WeakMap`-keyed cache **bound to the User instance** plus an
+explicit `flush()` for queue workers — see §34/P. Mirror that pattern, not raw
+`static`.
+
+### 44.3 Container `resolve()` / `app('foo')` without `bound()` check
+
+`resolve('gdpr.user.reservedAbilities')` and `app('sentry.request')` are
+container-resolution shortcuts. If the binding doesn't exist (e.g., the suggested
+extension isn't installed), they throw a `BindingResolutionException`. In a
+constructor that runs on every boot, the throw kills the entire forum.
+
+```php
+// BAD — assumes the binding exists
+class MyPolicy extends AbstractPolicy {
+    public function __construct() {
+        $this->reservedAbilities = resolve('gdpr.user.reservedAbilities');
+    }
+}
+
+// GOOD — check before resolving
+class MyPolicy extends AbstractPolicy {
+    public function __construct(Container $container) {
+        $this->reservedAbilities = $container->bound('gdpr.user.reservedAbilities')
+            ? $container->make('gdpr.user.reservedAbilities')
+            : [];
+    }
+}
+```
+
+The pattern in `vendor/flarum/gdpr/src/Access/UserPolicy.php:21` works because the
+GDPR provider always registers the binding before policies resolve — but it relies on
+gdpr being installed. An extension consuming gdpr's bindings from outside that
+package must guard with `bound()`.
+
+```bash
+rg -n "resolve\\(\\s*['\"]" src/
+rg -n "app\\(\\s*['\"][^'\"]+['\"]\\s*\\)" src/
+```
+
+For each hit: is the resolved key bound by core, or by an extension your `extend.php`
+required? If the latter, wrap in `bound()` or require the extension explicitly.
+
+### 44.4 Singletons and `Extend\ServiceProvider`
+
+Service providers registering singletons (`$this->container->singleton(...)`) tie the
+singleton's lifetime to the container — which lives for the entire long-lived
+process. Don't store request-scoped data in a singleton. If you need per-request
+state, scope to `bindIf` + manual flush, or pass state through the call chain.
+
+### 44.5 Queue worker cleanup hooks
+
+For state that genuinely must persist within a request but never bleed across jobs,
+hook the `Illuminate\Queue\Events\JobProcessed` event and flush:
+
+```php
+(new Extend\Event())
+    ->listen(\Illuminate\Queue\Events\JobProcessed::class, function () {
+        \Vendor\MyExt\State::flushPerRequest();
+    });
+```
+
+This is also where you'd flush an internal request-scoped cache between job runs in
+a worker that handles dozens of jobs per minute.
+
+---
+
+## §45. Migrations on core tables
+
+The single highest-severity production-risk finding in recent reviews has been
+**migrations that `ALTER TABLE` against core's `users`, `discussions`, `posts`, or
+`discussion_user` tables**. The damage isn't a bug — it's downtime: an online
+`ALTER TABLE` on a `users` table with 5 million rows can lock the table for minutes
+on MySQL <8.0 / MariaDB, taking the forum offline during the install. On a community
+running on managed MySQL with no `pt-online-schema-change`, the operator has no
+escape hatch.
+
+### 45.1 The companion table convention
+
+**Rule**: extension data NEVER goes on a core table. Always a companion table with a
+1:1 or 1:many FK back to the core row, cascading on delete.
+
+```bash
+# Find offenders
+rg -n "Schema::table\\('(users|discussions|posts|discussion_user|groups|tags)'" migrations/
+rg -n "->table\\('(users|discussions|posts|discussion_user|groups|tags)'\\)" migrations/
+```
+
+**Anti-pattern** (a finding flagged recently as 🟠 high):
+
+```php
+// migrations/2026_03_01_000000_add_verification_columns_to_users.php
+return Migration::addColumns('users', [
+    'verification_status' => ['string', 50, 'nullable' => true],
+    'verified_at'         => ['dateTime', 'nullable' => true],
+    'verification_note'   => ['text', 'nullable' => true],
+]);
+```
+
+**Correct shape**:
+
+```php
+// migrations/2026_03_01_000000_create_user_verifications_table.php
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Database\Schema\Builder;
+
+return [
+    'up' => function (Builder $schema) {
+        if ($schema->hasTable('user_verifications')) return;
+
+        $schema->create('user_verifications', function (Blueprint $table) {
+            $table->unsignedInteger('user_id')->primary();    // 1:1 — PK is user_id
+            $table->string('status', 50);
+            $table->dateTime('verified_at')->nullable();
+            $table->text('note')->nullable();
+            $table->timestamps();
+
+            $table->foreign('user_id')
+                  ->references('id')->on('users')
+                  ->cascadeOnDelete();                        // user delete cascades
+        });
+    },
+    'down' => function (Builder $schema) {
+        $schema->dropIfExists('user_verifications');
+    },
+];
+```
+
+Then on the User model in `extend.php`:
+
+```php
+(new Extend\Model(User::class))
+    ->hasOne('verification', UserVerification::class, 'user_id'),
+```
+
+…and in `src/Models/UserVerification.php`:
+
+```php
+class UserVerification extends AbstractModel
+{
+    protected $table = 'user_verifications';
+    protected $primaryKey = 'user_id';
+    public $incrementing = false;
+}
+```
+
+### 45.2 Why the companion table convention is non-negotiable
+
+1. **Multi-extension safety**: two extensions adding columns to `users` step on each
+   other's migrations, and if both add `verified` with different semantics, install
+   order decides which wins.
+2. **Uninstall is reversible**: dropping a companion table is one statement;
+   undoing column additions to `users` requires the operator to trust the down
+   migration.
+3. **Online DDL on core tables takes locks**: even MySQL 8 `ALGORITHM=INPLACE`
+   migrations briefly lock the table, and on tables the SPA polls every few seconds
+   (the `users` row of the actor on every authenticated request), that's a visible
+   spike.
+4. **Audit / GDPR cleanliness**: a companion table is opt-in to `Data\User` export
+   (you write your own `DataType`). Columns on `users` are pulled in automatically
+   by `Flarum\Gdpr\Data\User` and may need to be added to `removeUserColumns()` —
+   easy to forget.
+5. **Migration ordering**: when your extension is uninstalled and reinstalled (e.g.,
+   to upgrade), columns added directly to `users` either persist (orphan) or get
+   re-added with `if (! Schema::hasColumn(...))` guards that drift between
+   extensions.
+
+### 45.3 The "retroactive violation" remediation path
+
+If you inherited an extension that added columns to `users`, you cannot just delete
+the migration — production forums have the columns. The remediation is:
+
+1. New migration creates the companion table.
+2. New migration copies data: `INSERT INTO user_verifications (user_id, status, ...) SELECT id, verification_status, ... FROM users WHERE verification_status IS NOT NULL`.
+3. New migration drops the columns from `users`.
+4. Update all readers to use the companion model.
+5. Bump major version — this is a breaking schema change for downstream extensions reading the old columns.
+
+This is expensive enough that reviewers flag the original violation as 🟠 high — the
+remediation cost is paid forever.
+
+### 45.4 Reading core-table columns from a relation, not the row
+
+```php
+// BAD — re-introduces dependency on a column being on `users`
+$status = $user->verification_status;
+
+// GOOD — companion relation
+$status = $user->verification?->status;
+```
+
+For Schema fields exposing the relation's data, use `->property(...)` on a Schema field
+backed by an Eloquent accessor that reads through the relation, plus `eagerLoad` on
+the resource's `Index` endpoint (§38.1).
+
+### 45.5 Quick checklist
+
+- [ ] No `Schema::table('users'/'discussions'/'posts'/...)` in migrations.
+- [ ] Every extension table has an explicit FK back to the core table it relates to.
+- [ ] FK has `cascadeOnDelete()` (or `nullOnDelete()` if the row should survive deletion).
+- [ ] Composite or covering index for the most common `WHERE` shape (see §38.3).
+- [ ] `extend.php` wires the relation via `Extend\Model->hasOne()`/`->hasMany()`.
+- [ ] No reader code casts `$user->custom_column` — every read goes through the relation.
+
+---
+
+## §46. Event listener / blueprint subject-type contracts
+
+Flarum's polymorphic associations (`subject_type` + `subject_id` on
+`notifications` and `subscriptions`, `commentable_type` on the activity log if
+enabled) trust the writer. Whatever class string you stuff into `subject_type` is
+what the loader will `instanceof` against — there is no compile-time check that the
+type you wrote is the type the consumer expects. Passing the wrong model corrupts
+the polymorphic pair: the loader fetches a row of the wrong table by an ID that
+happens to collide.
+
+### 46.1 The Blueprint subject contract
+
+A `Blueprint` declares a "subject" by returning a model from `getSubject()`. The
+notification table stores `subject_type = get_class($blueprint->getSubject())` and
+`subject_id = $blueprint->getSubject()?->id`. When the frontend renders the
+notification, it issues `GET /api/notifications` which includes the subject via a
+sparse fieldset matching `subject_type`. If `subject_type` is `User` but the
+notification is "about a Discussion the user posted in", every consumer using the
+subject is reading user N with the discussion's ID.
+
+**Anti-pattern** flagged in a recent review (paraphrased):
+
+```php
+// UponUserDeletion handler — wrong subject
+class UponUserDeletion {
+    public function handle(UserDeleted $event): void {
+        foreach ($event->user->subscriptions as $sub) {
+            // BAD — $event->user is the User, but $sub expects a Discussion/Tag
+            event(new SubscriptionCancelled($event->user, $sub));
+        }
+    }
+}
+```
+
+`SubscriptionCancelled` was modelled to carry the `Subscription` and **the
+subscription's subject model** (the Discussion or Tag the subscription was for).
+Passing the User as the second argument silently writes `User` into the subject
+column for every downstream listener — discussion-level subscription listeners then
+fail on `instanceof Discussion`, group-level listeners fail on `instanceof Group`, and
+the actual cancellation work doesn't happen.
+
+**Correct shape**:
+
+```php
+foreach ($event->user->subscriptions as $sub) {
+    event(new SubscriptionCancelled($event->user, $sub->subject));  // resolved through subject morph
+}
+```
+
+For your own blueprints, declare and enforce the subject type at the construction
+site:
+
+```php
+class MyBlueprint implements BlueprintInterface
+{
+    public function __construct(public Discussion $discussion) {}   // typed constructor
+
+    public function getSubject(): ?AbstractModel { return $this->discussion; }
+    public function getType(): string             { return 'myextDiscussionFoo'; }
+    public function getData(): mixed              { return ['discussionId' => (int) $this->discussion->id]; }
+}
+```
+
+The typed constructor (`public Discussion $discussion`) is the contract. A caller
+can't accidentally pass `User` — PHP throws a `TypeError` at construction.
+
+### 46.2 Notification type strings — server and frontend must agree byte-for-byte
+
+`Blueprint::getType()` returns a string like `myextDiscussionFoo`. The frontend reads
+the same string via `app.store.find('notifications')` and dispatches to a renderer
+registered as `app.notificationComponents['myextDiscussionFoo'] = MyComponent`. A
+typo in either string (`myextDiscussionFoo` vs `myextDiscussionFooo`) silently breaks
+the renderer: the notification arrives, but the frontend has no component for the
+type and renders blank.
+
+A reviewer recently flagged "Frontend notification type key typo —
+`byobuPrivateDiscussionMadePubic` (missing `l`) means the made-public alert never
+fires". The bug is invisible without a manual smoke test because the notification
+still appears in the DB, the API still serves it, and no error surfaces in the
+console.
+
+**Rule**: declare the type string ONCE, as a class constant on the blueprint, and
+import it into JS via a translator key or a serializeToForum attribute.
+
+```php
+// PHP
+class MyBlueprint implements BlueprintInterface
+{
+    public const TYPE = 'myextDiscussionFoo';
+
+    public function getType(): string { return self::TYPE; }
+}
+```
+
+```ts
+// JS — read it from the server-provided forum attribute, never literal
+app.notificationComponents[app.forum.attribute('myextNotificationType')] = MyComponent;
+```
+
+This is over-engineered for a single notification type but is the only structural
+fix that survives renames. For 2–3 types, just have a code-review checklist:
+"compare `getType()` against the JS string verbatim".
+
+### 46.3 `beforeSending` recipient filter — re-checking visibility
+
+Even with the correct subject, a notification's recipient list must be re-filtered
+through `can('view', $subject)` (§19). The `Extend\Notification::beforeSending`
+filter is the canonical hook:
+
+```php
+// extend.php
+(new Extend\Notification())
+    ->beforeSending(MyBlueprint::class, MyBlueprintRecipientFilter::class);
+```
+
+```php
+class MyBlueprintRecipientFilter
+{
+    public function __invoke(MyBlueprint $blueprint, array $users): array
+    {
+        return array_values(array_filter(
+            $users,
+            fn (User $u) => $u->can('view', $blueprint->discussion)
+        ));
+    }
+}
+```
+
+`flarum/subscriptions` does this for `FilterVisiblePostsBeforeSending`
+([vendor/flarum/subscriptions/src/Notification/FilterVisiblePostsBeforeSending.php:24](../../vendor/flarum/subscriptions/src/Notification/FilterVisiblePostsBeforeSending.php#L24)).
+Copy the shape.
+
+### 46.4 `getData()` payload — IDs only, never content
+
+Re-stating §19: the `data` JSON column is returned verbatim with no policy re-check
+at read time. Put **IDs and primitive scalars only**. The frontend rehydrates via the
+subject relation, which IS visibility-gated.
+
+```bash
+rg -n "function getData\\(" src/
+```
+
+For each blueprint's `getData()`, verify the return is only `int`/`string`/`bool` IDs.
+Any user-controlled string, free-text content, or other-user identifier is a leak
+vector.
+
+### 46.5 Subject-type contracts when extending another extension's blueprint
+
+If you `Extend\Notification::type(OtherExtensionBlueprint::class, ['alert', 'email'])`
+to plug an existing blueprint into a new channel, you inherit that blueprint's
+subject type contract. You can't change the subject — you can only adapt the
+rendering. Don't override `getSubject` via reflection or trait magic; that's the path
+to "discussion-typed subjects served as users".
+
+---
+
+## §47. Admin-controlled execution surfaces
+
+An admin compromise is not the same threat model as a guest compromise, but
+defense-in-depth principles still apply. An extension that says "admins paste raw JS
+here and it runs in every visitor's browser" creates a **persistent stored-XSS
+primitive** that survives an admin password rotation: an attacker who briefly
+compromises admin credentials (phishing, session hijack, leaked panel password)
+plants the payload, and every subsequent visitor executes it until the next admin
+notices. The trade-off is sometimes acceptable — Flarum core itself exposes
+`headerHtml` / `footerHtml` / `customCss` / `welcomeMessage` for this reason — but
+new extensions should not casually add to the surface.
+
+### 47.1 The `createContextualFragment` trap
+
+```ts
+// BAD — executes script tags
+const range = document.createRange();
+range.selectNode(document.body);
+const fragment = range.createContextualFragment(adminProvidedHtml);
+document.body.appendChild(fragment);
+```
+
+`createContextualFragment` parses HTML and **executes** any `<script>` it contains,
+unlike `innerHTML = ...` which does NOT execute inline scripts but does execute
+inline event handlers and `<img onerror=...>`. Both run admin-supplied JS. If your
+extension exposes a custom-HTML/custom-JS settings field, you've shipped persistent
+XSS with admin authorship.
+
+```bash
+rg -n "createContextualFragment|insertAdjacentHTML|innerHTML\\s*=" js/src/
+```
+
+For each hit, trace the input. If the source is `app.forum.attribute('...')` or a
+settings field, the rule is:
+- The setting must be `admin-only-editable` (already true for settings).
+- The output must be sanitized server-side BEFORE serialization (§9.2 + §21) AND
+  mirrored in JS sanitization.
+- The settings panel must display a `WARNING — this content executes in every
+  visitor's browser` banner. Operators don't always understand that "raw HTML" =
+  "stored XSS by admin authorship".
+
+### 47.2 Settings-as-`<script>` — never
+
+```php
+// BAD — admin pastes JS, every visitor runs it
+(new Extend\Settings())
+    ->serializeToForum('myextCustomJs', 'myext.custom_js', null, '')
+```
+
+```ts
+// BAD — paired frontend
+const code = app.forum.attribute('myextCustomJs');
+new Function(code)();                                    // or: eval(code)
+```
+
+Don't ship this. If your use case is "let admins inject GA / analytics / custom
+trackers", offer a dedicated settings field with a fixed shape (`google_analytics_id`,
+`matomo_url`) and emit the script tag yourself with a strict allowlist.
+
+### 47.3 `style.innerHTML` and CSS injection
+
+A setting value interpolated into a `<style>` tag's `innerHTML` is **CSS-injection
+adjacent**, not stored-XSS — but CSS can exfiltrate text via attribute selectors
+hitting attacker-controlled URLs, and `expression()` was a thing on old IE. Treat any
+CSS-from-admin-settings with the same suspicion as raw HTML.
+
+```ts
+// BAD
+const styleEl = document.createElement('style');
+styleEl.innerHTML = `.MyExt-tab { height: ${app.forum.attribute('myextTabHeight')}; }`;
+document.head.appendChild(styleEl);
+
+// GOOD — coerce to a known shape
+const raw = String(app.forum.attribute('myextTabHeight') ?? '');
+const px  = /^\d{1,3}(\.\d+)?(px|rem|em|%)?$/.test(raw) ? raw : '48px';
+styleEl.textContent = `.MyExt-tab { height: ${px}; }`;
+```
+
+Use `textContent`, not `innerHTML`, when assigning to a `<style>` element —
+`textContent` does not invoke the HTML parser. And **validate the value against the
+narrowest possible regex** before interpolation. Free-text settings flowing into CSS
+is a finding regardless of how harmless it looks.
+
+### 47.4 The custom-JS / custom-CSS / custom-HTML settings pattern (when it IS required)
+
+Some extensions exist specifically to give admins these surfaces — a "site
+customization" extension is the obvious one. If you must ship this:
+
+1. **Sanitize server-side** in the `serializeToForum` cast (§21) — not just in JS. A
+   JS-only sanitizer is bypassed by any mXSS / DOMParser blocklist gap (`<svg>`,
+   `<math>`, `<noscript>` foreign-content tricks).
+2. **Surface the threat model in the settings UI**: a fixed warning banner above the
+   field explaining that the content executes for every visitor.
+3. **Restrict the permission** to `administrate` + a dedicated `myext.editCustomCode`
+   ability, gated through `Extend\Policy`. Don't piggyback on the generic admin
+   permission.
+4. **Audit-log every change** to a separate table the operator can review (`who
+   changed the custom JS, when, what was the diff`). Persistence of the change is
+   the moderator's tripwire.
+5. **Subresource Integrity (SRI) for any external CDN URLs** the admin pastes — the
+   extension can scan the saved value for `<script src="...">` and either require
+   `integrity="..."` or reject.
+
+This is a lot of work. The honest framing in the settings UI is "this is dangerous,
+but you asked for it" — never silently expose the surface.
+
+### 47.5 Defense for non-customization extensions that incidentally render admin HTML
+
+If your extension exposes an HTML setting (welcome banner, footer text, custom
+embed), use Flarum core's same convention: render via `m.trust` only after
+**server-side sanitization** through an allowlist HTML sanitizer (`HTMLPurifier`,
+`ezyang/htmlpurifier`, or a hand-written DOMDocument-based sanitizer). The shipped
+sanitizer class MUST be wired into the `serializeToForum` cast closure (§21) — a
+sanitizer class in `src/Support/` that isn't called from any cast is dead code that
+doesn't protect you.
+
+```bash
+rg -n "m\\.trust\\(.*forum\\.attribute" js/src/
+rg -n "serializeToForum\\([^)]+\\)" extend.php | rg -v "boolVal|intval|HtmlSanitizer|sanitize"
+```
+
+For each `m.trust(app.forum.attribute(...))`, the corresponding `serializeToForum`
+call must pass a sanitizer cast. If the cast is `null` or missing, that's a critical
+finding — the JS-only mirror is one bypass away from stored XSS.
+
+### 47.6 Severity calibration for admin-controlled surfaces
+
+| Surface | Threat model | Severity |
+|---|---|---|
+| `customJs` settings field, no sanitization, executes in browser | Admin compromise → persistent XSS until admin notices | 🟠 medium (admin pre-req) but with high impact ceiling — flag as high |
+| Admin-pasted HTML rendered via `m.trust` without sanitizer | Same as above, slightly narrower exploit class | 🟠 medium |
+| `style.innerHTML` interpolation of a free-text setting | CSS-injection / exfil via attribute selectors | 🟡 low |
+| `createContextualFragment` of server response in a footer/header injector | Same as `m.trust` of admin HTML | 🟠 medium |
+| Server emits inline `<script>` with unescaped PHP values interpolated | Stored XSS by any actor whose value lands in the script | 🔴 high (depends on actor) — see §37 |
+
+### 47.7 Quick checklist
+
+- [ ] No `createContextualFragment` / `new Function(...)` / `eval(...)` consuming admin-controlled strings.
+- [ ] No `innerHTML = settingValue` outside of a sanitized pipeline.
+- [ ] CSS-from-settings is `textContent`, not `innerHTML`, AND value is regex-validated.
+- [ ] Any HTML sanitizer class your extension ships is actually wired into the `serializeToForum` cast closure (not just present in `src/`).
+- [ ] Admin custom-code settings carry an inline warning explaining the threat model.
+- [ ] Permission to edit admin-execute settings is a dedicated ability, not just `administrate`.
+
+---
+
+## §48. Review report output contract
+
+When the user invokes a code-review workflow on this extension — `/review`,
+`/security-review`, "review this branch", "audit this extension", or any equivalent
+phrasing — Claude must produce a structured report that mirrors the marketplace's
+review surface (the screenshots the operator pastes back from their package page).
+This section is the **output contract** for that report.
+
+### 48.1 Trigger
+
+Produce the report when the user explicitly asks for a code review of the extension
+or branch:
+
+- `/review`, `/security-review`, `/ultrareview`
+- "review this", "audit this", "check this for production", "is this safe to ship?"
+- After the user has just merged a release branch and asks "anything I missed?"
+
+Do **not** produce the report unprompted during normal development conversations.
+A grep for a single bug or a one-file refactor is not a review.
+
+### 48.2 Ask-before-emit protocol
+
+**The full report is long.** Before emitting it, ask the user one short question:
+
+> "I've finished the review (N findings: X critical / Y high / Z medium / W low,
+> verdict: <verdict>). Do you want the full structured report (executive summary +
+> findings table + verdict), or just the punch list of fixes?"
+
+Use AskUserQuestion with two clearly-labelled options:
+- "Full report" — emit the full §48.4 template.
+- "Punch list only" — emit just the findings as a numbered list with severity tags,
+  no executive summary or verdict block.
+
+If the user has already pre-confirmed in the same session ("yes, give me the full
+report after each review"), skip the question and emit directly. Save that
+preference as a feedback memory only if the user repeats it across sessions.
+
+### 48.3 Scoring rubric
+
+Two independent 0–100 scores. **Never reuse the same number for both** — they measure
+different things.
+
+#### Quality Score (0–100, higher = better)
+
+Start at 100. Deduct per finding, capped per dimension:
+
+| Severity (§33) | Deduction | Cap per dimension |
+|---|---|---|
+| 🔴 Critical | −25 | no cap — every critical applies in full |
+| 🟠 High | −8 | max −24 (3 highs saturates the high bucket) |
+| 🟡 Medium | −3 | max −12 |
+| ⚪ Low | −2 | max −6 |
+| Informational | 0 | display only — does not affect score |
+
+Cross-dimensional additive cap: a single finding never deducts more than its own
+severity weight, regardless of how many dimensions it touches (security + robustness
++ dead code on one bug = one −X, not −3X).
+
+Floor at **20**. Below 20 the score signals "this is scaffolding, not an
+extension" — collapse to 20 and emit a single verdict explaining it.
+
+Round to the nearest integer. Show as `<score>/100`.
+
+#### Vibe Coded score (0–100, higher = more AI-generated-looking)
+
+Heuristic-only, not a verdict modifier. Score against these tells:
+
+| Tell | Weight |
+|---|---|
+| Comments explaining WHAT the code does (not WHY) | +8 |
+| Multi-paragraph docstrings on internal helpers | +6 |
+| Try/catch around every async call with `console.error` swallow | +5 |
+| Variables / functions named with `enhanced`/`utility`/`helper`/`manager` for no reason | +4 |
+| Boilerplate `// TODO:` and `// FIXME:` left in the shipped bundle | +4 |
+| Repeated near-identical helper across 3+ files (no extraction) | +5 |
+| Over-engineered abstraction for a one-call-site need | +6 |
+| README full of bullet points that the code doesn't deliver | +10 |
+| `as any` / `@ts-ignore` clusters | +4 |
+| Excessive emoji in code comments or commit messages | +3 |
+| Code structurally clean, terse, named consistently, comments-as-WHY only | −15 |
+| Tests present and meaningful (not snapshot-only) | −10 |
+| Git log shows iterative commits with real review feedback | −8 |
+
+Floor 0, cap 100. Show as `<score>/100`. The score is informational — do not let it
+modify the Quality Score.
+
+### 48.4 Verdict thresholds
+
+| Quality Score | Worst severity | Verdict |
+|---|---|---|
+| ≥ 80 | No 🔴 critical, no 🟠 high | **Approved, should be safe to use in production.** |
+| ≥ 80 | Has 🟠 high | **Approved with concerns, might need some adjustments to be safe to use in production.** |
+| 75–79 | Any | **Approved with concerns, might need some adjustments to be safe to use in production.** |
+| 50–74 | Any | **Rejected, is too risky to be used in production.** |
+| < 50 | Any | **Rejected, is too risky to be used in production.** (plus a one-liner: "this extension is a scaffolding/skeleton — implement the advertised features before re-review" if Quality < 50 and no critical findings.) |
+
+The verdict string is reproduced **verbatim** — the marketplace UI matches on the
+exact phrasing.
+
+### 48.5 Executive summary template (3–4 sentences)
+
+Write a tight 3–4 sentence executive summary mirroring the marketplace shape. Each
+sentence has a distinct job:
+
+1. **Verdict + production-readiness framing** — "This extension is safe to publish but requires fixes in N high-severity areas before it can be considered production-ready for large communities."
+2. **The most impactful finding(s)** — one or two sentences naming the concrete bug, the user-visible failure mode, and the affected blast radius.
+3. **Structural quality note** — one sentence on what's GOOD: clean architecture, good test coverage, consistent conventions. Reviewers calibrate severity against structural quality; pretending nothing is good when something is reads as biased.
+4. **Performance / scale note** — one sentence on N+1, payload size, expensive sync paths, or "no significant performance concerns".
+
+Keep each sentence under 35 words. No bullet points. The summary is prose, not a
+checklist.
+
+**Anti-patterns** in the summary:
+- "This extension does X, Y, Z" — that's a description, not a verdict.
+- Repeating finding titles verbatim — the table below shows them; the summary should add context.
+- Marketing-flavored language — "thoughtfully engineered", "robust", "battle-tested". The reviewer voice is neutral.
+
+### 48.6 Findings table format
+
+Below the summary, emit a Markdown table with **exactly five columns**:
+
+```markdown
+| # | Severity | Dimension | Title | One-line impact |
+|---|---|---|---|---|
+| 1 | 🔴 critical | security | Server-Side Request Forgery via unrestricted URL fetcher | Unauthenticated attacker can probe internal infra and cloud metadata. |
+| 2 | 🟠 high | production risk | Migrations on high-traffic core tables | `discussions`, `users`, `discussion_user` ALTERs lock for minutes on large forums. |
+| 3 | 🟠 high | robustness | UponUserDeletion passes User as subscription model | Polymorphic subject_type corruption — downstream listeners get the wrong model class. |
+| 4 | 🟡 medium | security | Bounty amount passed to Stripe without floor/sign validation | Negative or fractional amounts may trigger Stripe rejections or refunds. |
+| 5 | ⚪ low | technical debt | CheckoutController instantiates Handler directly instead of via DI | Hidden dependency; complicates testing and replacement. |
+```
+
+#### Severity column
+
+Use the emoji prefix from §33 (`🔴 critical` / `🟠 high` / `🟡 medium` / `⚪ low` /
+`ℹ informational`). Never `info` / `inf` / shorthand.
+
+#### Dimension column
+
+Pick **exactly one** dimension per finding. The dimension vocabulary is fixed:
+
+| Dimension | When to use |
+|---|---|
+| `security` | Exploitable vulnerability or weakened security primitive (XSS, SSRF, IDOR, missing authz, weak crypto). |
+| `production risk` | Behavior that breaks for a meaningful fraction of forums at scale (long-running migrations on core tables, OOM under realistic load, queue-worker leaks). |
+| `robustness` | Code that handles the happy path but silently fails the unhappy path (swallowed exceptions, missing user-visible error UI, missing null checks, wrong type contracts on polymorphic associations). |
+| `conventions` | Diverges from Flarum 2.x patterns documented in this file in a way reviewers and operators will flag (composer constraint mismatches, `Capsule\Manager` usage, missing type hints). |
+| `dead code` | Code that doesn't ship value: unused imports, unrendered components, commented-out blocks, stale CSS targeting nothing. |
+| `technical debt` | Carrying cost that grows over time but isn't a bug today (PHPStan disabled, helper duplication, `as any` clusters, missing tests). |
+
+If a finding genuinely spans two dimensions, **pick the one with the larger impact**
+and mention the other in the one-line impact.
+
+#### Title column
+
+Action-style, ≤ 80 chars. Concrete enough that the operator can grep the codebase
+for the bug from the title alone. Examples from the screenshots reproduced verbatim:
+- "Migrations on high-traffic core tables"
+- "UponUserDeletion passes User as subscription model"
+- "GDPR Erasing event dependency not declared in composer.json"
+- "ProductResource Index endpoint has no authentication requirement"
+
+#### One-line impact column
+
+One sentence, ≤ 120 chars, describing what breaks for the operator if unfixed. Avoid
+restating the title.
+
+### 48.7 Per-finding detail block (optional, after the table)
+
+For each finding ranked 🔴 critical or 🟠 high, follow the table with a short detail
+block:
+
+```markdown
+#### F2 — Migrations on high-traffic core tables
+**Severity:** 🟠 high · **Dimension:** production risk · **Section:** §45
+
+**Where:** `migrations/2026_03_01_000000_add_columns_to_discussions.php:8`,
+`migrations/2026_03_05_000000_add_columns_to_users.php:8`, plus three siblings.
+
+**What:** Five migrations issue `Schema::table('discussions'/'users'/'discussion_user', ...)`
+adding columns directly to core tables.
+
+**Why it matters:** On a forum with 5 M+ discussion rows, MySQL <8 holds a metadata
+lock for the duration of the `ADD COLUMN`. Operators on managed MySQL without
+`pt-online-schema-change` will see the forum unresponsive during install.
+
+**Fix:** Move every added column to a companion table (`{ext}_discussion_data` keyed
+by `discussion_id`), with `cascadeOnDelete()` FK and the same indexes the original
+ALTER carried. See §45.
+```
+
+For 🟡 medium and ⚪ low findings, the table row alone is enough — don't pad.
+
+### 48.8 Full report skeleton
+
+When the user picks "Full report", emit in this exact order:
+
+```markdown
+## Code review
+
+> Verdict line (verbatim from §48.4)
+
+- **Version:** <git tag, branch name, or "unreleased — HEAD at <sha7>">
+- **Reviewed at:** <YYYY-MM-DD HH:mm:ss tz, e.g. "2026-05-15 14:32:00 -03">
+- **Quality Score:** <N>/100
+- **Vibe Coded:** <N>/100
+
+### Executive summary
+
+<3–4 prose sentences per §48.5>
+
+### Findings
+
+<§48.6 table>
+
+### Details
+
+<§48.7 blocks for every critical and high finding, ordered by severity then by file>
+
+### Suggested fix order
+
+1. <finding #N> — <one-line "do this first because">
+2. <finding #M> — ...
+```
+
+The "Suggested fix order" block is the single most useful section for the operator
+— it converts the report into an actionable backlog. Order by:
+1. 🔴 critical first (always);
+2. Within a severity, prefer fixes that unblock other fixes (e.g., adding a
+   companion table BEFORE rewriting readers);
+3. Cheap quality-score wins last (remove `console.log`, drop unused import) so the
+   operator can see the score climb between releases.
+
+### 48.9 Output discipline
+
+- **Use the marketplace verbatim phrasings** in §48.4 — the package page renders
+  matches on those strings.
+- **Reproduce the timestamp in the user's local TZ** if known (memory: `currentDate`).
+  If not, use UTC and label it.
+- **No invented file paths.** Every "Where:" line must be a path that exists in the
+  branch under review. Verify with `Read` or `Glob` before emitting.
+- **No invented findings.** If a section of this CLAUDE.md applies but the codebase
+  is clean against it, do NOT manufacture a finding to pad the table.
+- **No empty findings table.** If there are zero findings, emit:
+  > "No findings against this CLAUDE.md's §0–§47 surface. Quality Score: 100/100.
+  > Vibe Coded: <score>/100. Verdict: **Approved**, should be safe to use in
+  > production."
+- **Mirror the example summary's tone** — neutral, observational, structured. No
+  "great work!" / "looks good!" / "well done" — reviewer voice is detached.
+- **The report is the final output of the review turn.** Don't immediately follow
+  with a "next, want me to fix these?" prompt unless the user asked. The report is
+  the deliverable; the fix conversation is a separate turn.
+
+### 48.10 Worked example (matches the screenshots the operator shared)
+
+Reproduced here as the canonical shape — when in doubt, copy this layout:
+
+```markdown
+## Code review
+
+> **Approved with concerns, might need some adjustments to be safe to use in production.**
+
+- **Version:** 2.0.0-beta.6
+- **Reviewed at:** 2026-05-08 03:36:02 UTC
+- **Quality Score:** 75/100
+- **Vibe Coded:** 18/100
+
+### Executive summary
+
+This extension is safe to publish but requires fixes in two high-severity areas
+before it can be considered production-ready for large communities. A bug in
+`UponUserDeletion` passes the User model as the subscription's subject model, which
+will silently corrupt data for any downstream event listener expecting a Discussion,
+Group, or Tag; additionally, five migrations alter the high-traffic `discussions`,
+`users`, and `discussion_user` tables, which will cause significant downtime on
+large forums. The code is structurally sound, well-tested, and shows clear
+architectural intent, but has a handful of correctness and production-safety gaps
+that suggest it was not fully exercised under realistic conditions. N+1 queries are
+avoided through eager loading of `bountyCurrency` and `tags` relationships, but the
+`SubscriptionResource` fetches all Stripe `PaymentIntents` and `Subscriptions` for a
+customer in a single `results()` call with no pagination cap, which may be slow for
+users with many transactions.
+
+### Findings
+
+| # | Severity | Dimension | Title | One-line impact |
+|---|---|---|---|---|
+| 1 | 🟠 high | production risk | Migrations on high-traffic core tables | Five `ALTER`s lock `discussions`/`users` for minutes on large forums. |
+| 2 | 🟠 high | robustness | UponUserDeletion passes User as subscription model | Polymorphic subject corruption — downstream listeners read the wrong type. |
+| 3 | 🟡 medium | dead code | Unused import `TotalBountySelect` | Adds ~2 KB to forum bundle for no rendering. |
+| 4 | 🟡 medium | robustness | GDPR Erasing event dependency not declared in composer.json | Extension wires a `Flarum\Gdpr\Events\Erased` listener with no `suggest`/`require` or `class_exists` guard. |
+| 5 | 🟡 medium | security | Bounty amount passed to Stripe without floor/sign validation | Negative or zero values reach Stripe; refunds or rejections at the gateway. |
+| 6 | 🟡 medium | security | `ProductResource` Index endpoint has no authentication requirement | Unauthenticated users enumerate the product catalog including draft/disabled rows. |
+| 7 | ⚪ low | technical debt | `CheckoutController` instantiates Handler directly instead of via DI | Harder to test; hides dependency. |
+| 8 | ⚪ low | dead code | Redundant double-check in `Discussions/IsPrivate` | Same guard runs twice on every read. |
+
+### Details
+
+#### F1 — Migrations on high-traffic core tables
+**Severity:** 🟠 high · **Dimension:** production risk · **Section:** §45
+
+**Where:** `migrations/2026_03_01_*_add_to_discussions.php:8` and four siblings.
+
+**What:** Five migrations issue `Schema::table('discussions'/'users'/'discussion_user', ...)`.
+
+**Why it matters:** On a forum with 5 M+ rows, MySQL <8 holds a metadata lock for
+the duration of `ADD COLUMN`. Install becomes a maintenance window.
+
+**Fix:** Move added columns to companion tables (`bounty_discussion_data` keyed by
+`discussion_id`, etc.), with `cascadeOnDelete()` FK. See §45.
+
+#### F2 — UponUserDeletion passes User as subscription model
+**Severity:** 🟠 high · **Dimension:** robustness · **Section:** §46.1
+
+**Where:** `src/Listener/UponUserDeletion.php:42`.
+
+**What:** `event(new SubscriptionCancelled($user, $user))` — second arg should be
+the subscription's subject model (Discussion/Group/Tag), not the User.
+
+**Why it matters:** Downstream listeners do `instanceof Discussion`/`Group`/`Tag`
+checks that never match; cancellation work is silently skipped; the polymorphic
+`subject_type` column gets `User::class` written into rows whose `subject_id` is a
+discussion ID.
+
+**Fix:** `event(new SubscriptionCancelled($user, $subscription->subject))`.
+
+### Suggested fix order
+
+1. F2 — typed constructor on `SubscriptionCancelled` prevents this whole class of
+   bug, and once fixed the existing tests will cover it.
+2. F1 — schema change needs a release-coordinated migration; queue for the next
+   minor version.
+3. F5 — input validation on money is a one-line guard plus a regression test.
+4. F6 — add `Endpoint\Index::make()->authenticated()` to `ProductResource`.
+5. F4 — add `class_exists(\Flarum\Gdpr\Events\Erased::class)` gate and move
+   `flarum/gdpr` to `suggest`.
+6. F3, F7, F8 — cosmetic.
+```
+
+### 48.11 Calibration anchors
+
+If you find yourself uncertain about a score, anchor against these published reviews:
+
+| Quality | Vibe | Symptoms | Verdict |
+|---|---|---|---|
+| 32 | 35 | Unauth SSRF + TLS disabled + no rate limiting | Rejected |
+| 40 | 20 | Empty skeleton, only `console.log` ships | Rejected |
+| 67 | 50 | Multiple highs across security and robustness | Rejected (just barely) |
+| 75 | 18 | 2 highs + 4 mediums + 2 lows, otherwise clean architecture | Approved with concerns |
+| 77 | 42 | 1 high admin-XSS + 5 mediums, payload bloat | Approved with concerns |
+| 80 | 8 | 1 high core-table migration, 2 mediums, otherwise excellent | Approved with concerns |
+| 90+ | <15 | One or two lows, no security or robustness issues | Approved |
+
+If your scoring lands materially outside these anchors, re-check the rubric — you
+likely under- or over-weighted a finding.
 
 ---
 
