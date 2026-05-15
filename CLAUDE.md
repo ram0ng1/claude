@@ -54,6 +54,10 @@ Base Github: https://github.com/ram0ng1/verified, https://github.com/ram0ng1/avo
 - §35 **CI/CD & GitHub Actions workflows** — baseline (lint, release, forum post) + 🔴🟠🟡⚪ hardening roadmap (SHA pinning, harden-runner, CodeQL, Dependabot, SLSA) + Claude scaffolding prompt
 - §36 **Shell command execution & external binaries** — `exec`/`proc_open`, FFmpeg/ImageMagick, argument injection, untrusted-media attack surface
 - §37 **Frontend `Content` injectors** (`Extend\Frontend->content()`) — SSR cost, raw-HTML `<head>` injection, `ApiResource` duplication
+- §38 **Performance, memory, N+1** — Schema `->get()` callbacks, in-memory buffering of downloads/exports, missing compound indexes, large blobs in `serializeToForum`, filter-in-PHP traps
+- §39 **Flarum version compatibility** — composer constraint vs API surface (v1.x/v2.x), MySQL-only SQL in migrations, Eloquent vs `ConnectionInterface`
+- §40 **Frontend robustness, TS discipline, CSS targeting** — `JSON.parse` traps, user-visible error UI, DOM scoping, `as any`, `color-mix()`, hardcoded truncation, helper deduplication, unreachable CSS
+- §41 **Logging discipline** — inject PSR-3 `LoggerInterface`; ban `Illuminate\Support\Facades\Log`
 
 ---
 
@@ -653,7 +657,13 @@ rg -n "->where\\(.*'like'" src/
 - `orderBy($request->input('sort'))` without a sort-column allowlist.
 - `LIKE` without escaping `%` and `_` from user input — user forces broader-than-intended matches (wildcard injection).
 - Any access to `$_GET`/`$_POST` directly. Always PSR-7: `$request->getQueryParams()`, `$request->getParsedBody()`, `$request->getUploadedFiles()`.
-- `Illuminate\Database\Capsule\Manager` used as a query entrypoint (`use Illuminate\Database\Capsule\Manager as DB; DB::table(...)`). It *works* because Flarum boots Capsule globally, but it's a convention smell — it reaches around Flarum's connection management and the static facade is fragile under tests and queue workers. Constructor-inject `Illuminate\Database\ConnectionInterface` (or `ConnectionResolverInterface`) and call `$this->db->table(...)`, or use an Eloquent model — Flarum already wires those. Reference smell: [src/Api/ForumAttributes.php:35](src/Api/ForumAttributes.php#L35) and [:55](src/Api/ForumAttributes.php#L55).
+- `Illuminate\Database\Capsule\Manager` used as a query entrypoint (`use Illuminate\Database\Capsule\Manager as DB; DB::table(...)`). It *works* because Flarum boots Capsule globally, but it's a convention smell — it reaches around Flarum's connection management and the static facade is fragile under tests and queue workers. Reference smell: [src/Api/ForumAttributes.php:35](src/Api/ForumAttributes.php#L35) and [:55](src/Api/ForumAttributes.php#L55).
+
+**Preferred order for DB access** (mirror what first-party extensions do):
+  1. **Eloquent model** (`Discussion::query()`, `User::query()`, your own `extends AbstractModel`). Always first choice — Flarum wires the connection, scopes, events, soft-deletes, and visibility traits for you. 95% of extension queries fit here.
+  2. **Method-injected `Illuminate\Database\ConnectionResolverInterface`** when a controller/handler needs raw SQL across multiple connections, or genuine bulk inserts (`->table('x')->insertOrIgnore([...])` with thousands of rows where Eloquent's per-row hydration is wasteful).
+  3. **Constructor-injected `Illuminate\Database\ConnectionInterface`** — last resort. Reviews flag direct `ConnectionInterface` constructor injection as a convention issue precisely because most of those cases were really Eloquent-shaped. Before adding `private ConnectionInterface $db` as a dependency, ask: would the class be cleaner with a model? Reference: a verification-style extension storing `verification_requests` rows had `UserResourceFields` and `ListApprovedUsersController` both injecting `ConnectionInterface` to count pending rows — an Eloquent `VerificationRequest` model with a `scopePending()` would eliminate both injections AND make the rest of §38.1 (N+1 fix via `with()`) trivial.
+  4. **`Illuminate\Database\Capsule\Manager`** — never. Static facade, breaks under queue workers, hides the dependency.
 
 ### Correct shape
 
@@ -1360,6 +1370,8 @@ rg -n "serializeToForum\\(" extend.php src/
 - Exposing any secret via `serializeToForum`: API keys, integration tokens, webhook URLs containing tokens, raw email addresses, internal IPs, license keys.
 - Exposing HTML/admin-controlled raw strings without a sanitizer cast.
 - **A server-side sanitizer applied to some admin-HTML fields but not others.** An extension that ships an `HtmlSanitizer` class AND uses it for one admin-HTML surface, but registers another as `->serializeToForum('jsKey', 'ext.html_key')` with **no cast argument** — that second field ships raw in the forum payload and relies *solely* on a JS-side mirror at render time. Per §9.2 the allowlist must hold on **both** sides; a JS-only guard means any mXSS bypass (DOMParser blocklist sanitizers commonly miss `<svg>`/`<math>`/`<noscript>` foreign-content) is guest-visible XSS with no server-side backstop. The cast closure is the only place a sanitizer runs for `serializeToForum` output — wire it there: `->serializeToForum('jsKey', 'ext.html_key', fn ($html) => HtmlSanitizer::sanitize($html), '')`. Reference asymmetry: [src/Content/CustomLoadingSpinner.php:39](src/Content/CustomLoadingSpinner.php#L39) sanitizes its admin HTML server-side, but [extend.php:163](extend.php#L163) serializes `avocado.custom_hero_html` raw — same extension, same `HtmlSanitizer`, inconsistent application.
+- **Admin-only operational settings serialized to every actor.** Retention windows (`*.retain_days`, `*.auto_delete_after`), purge thresholds, internal feature flags, and any "admin-tunable" knob that the forum frontend doesn't actually consume — these are payload weight + information disclosure for zero functional gain. Either keep them DB-only and read them server-side, or gate exposure to admins by checking `RequestUtil::getActor()->isAdmin()` inside a `Content` injector and emitting `window.__myextAdmin = { … }` only for them. See §38.4 for the size-conscious framing.
+- **Large blobs in `serializeToForum`.** Anything that can grow past a few hundred bytes — base64 SVG (admin-uploaded badges up to 256 KB), rendered HTML hero, JSON snapshots — bloats every forum-page payload, every API response, every guest view. Even small per-extension blobs compound across 5–10 installed extensions. If the asset is fetched only on a specific route, expose it via a dedicated `ApiResource` field or a public URL — not the global forum payload. See §38.4.
 
 ### Correct shape
 
@@ -1878,7 +1890,13 @@ for "small" changes.**
 - [ ] No `->fill($body)`, `->forceFill(…)`, `Model::create($body)`, `protected $guarded = []`.
 - [ ] Extending core resources (`UserResource` etc.) — every new field has explicit `->visible()`.
 - [ ] `Content` injectors (`Extend\Frontend->content()`) check their enable/visibility setting first, bound every query (`limit()`), apply per-actor visibility, JSON_HEX-encode any user-controlled data put into `$document->head[]`/`foot[]`, and don't duplicate a query already served by an `ApiResource` field (§37).
-- [ ] No `Illuminate\Database\Capsule\Manager` (`DB::table(...)`) as a query entrypoint — inject `ConnectionInterface` or use an Eloquent model (§10).
+- [ ] No `Illuminate\Database\Capsule\Manager` (`DB::table(...)`) as a query entrypoint — prefer an Eloquent model; constructor-injected `ConnectionInterface` is the last resort (§10, §39.3).
+- [ ] No `Schema\*->get(fn ...)` callback runs a per-row query (N+1). Use `eagerLoad`, a denormalized column, or `withCount` instead (§38.1).
+- [ ] Multi-column `WHERE a=? AND b=?` patterns are backed by a compound index in a migration (§38.3).
+- [ ] No `serializeToForum(...)` ships a blob > ~4 KB or an admin-only operational setting to every actor (§21, §38.4).
+- [ ] No controller builds a response by `file_get_contents` + `base64_encode` of a file — stream it via `Laminas\Diactoros\Stream` (§38.2).
+- [ ] No `Model::query()->get()->filter(...)` where the filter could be a SQL `where()` (§38.5).
+- [ ] Helper logic referenced from both a Schema getter and a controller lives on the model (accessor/method), not duplicated (§38.6).
 
 ### Backend — injection
 
@@ -1940,8 +1958,27 @@ for "small" changes.**
 - [ ] `app.session.user` accessed via `?.` optional chaining.
 - [ ] Same-origin (or explicit allowlist) check on every `fetch(userUrl)` call.
 - [ ] Streamed size cap on every `fetch` downloading multi-MB binary payloads.
+- [ ] Every `JSON.parse(...)` / `await response.json()` wrapped in try/catch with a user-visible error path (§40.1).
+- [ ] Every `.catch` / `try/catch` around an async call surfaces a `app.alerts.show({type:'error'}, …)` — no silent swallow (§40.2).
+- [ ] No `document.querySelector` / `document.getElementsByClassName` on a class that multiple component instances render — scope to `this.element` (§40.3).
+- [ ] No `as any` cast that hides a real type — augment the module instead (§40.4).
+- [ ] Modern CSS (`color-mix`, `:has`, `oklch`) has a `@supports`-guarded fallback when used on extensions targeting Flarum 1.x (§40.5).
+- [ ] Hardcoded list truncation (e.g. `.slice(0, 500)`) surfaces a count to the user — never silent (§40.6).
+- [ ] Helper functions appearing in 2+ component files are extracted to `js/src/common/utils/` (§40.7).
+- [ ] No `.less`/`.css` rule targets a class name that no JS/PHP emits (§40.8).
 - [ ] `tsc --noEmit` (TS projects) passes; `webpack --mode production` passes.
 - [ ] `js/dist/{forum,admin}.js` regenerated and committed.
+
+### Compatibility & portability
+
+- [ ] `composer.json` `"flarum/core"` constraint matches the API surface in `src/` — v2-only classes (`Flarum\Api\Resource\AbstractDatabaseResource`, `Flarum\Api\Schema\*`, `Flarum\Api\Endpoint\*`) require `"^2.0"` with no `^1.0` clause (§39.1).
+- [ ] No `INFORMATION_SCHEMA` / `RAND()` / `FROM_UNIXTIME` / `GROUP_CONCAT` / MyISAM-specific DDL in migrations — Schema Builder is portable across MySQL/PostgreSQL/SQLite (§39.2).
+- [ ] Composer `require` constraints on sister extensions (e.g. `flarum/tags`) are version-bounded — not `"*"` / unconstrained.
+
+### Logging
+
+- [ ] No `use Illuminate\Support\Facades\Log` — inject `Psr\Log\LoggerInterface` instead (§41).
+- [ ] Logged context never includes request body, headers, tokens, or secrets (§23 + §41).
 
 ### Migration & cleanup
 
@@ -1949,7 +1986,7 @@ for "small" changes.**
 - [ ] Migration has a working `down` OR documents why rollback is impossible.
 - [ ] If a setting/column was removed, the migration deletes its persisted rows.
 - [ ] Locale entries added for every visible string AND every custom permission ability.
-- [ ] No `// removed`/`// legacy` comments left on dead code.
+- [ ] No `// removed`/`// legacy` comments left on dead code, no `.less` block for a feature whose JS/PHP doesn't ship.
 
 ### Build & lint
 
@@ -3239,6 +3276,550 @@ full `JSON_HEX_*` flag set. Copy it. The gap is duplication:
 online-user list as an `avocadoOnlineUsers` API attribute, so every forum page runs the
 query twice. Resolve by deleting one side — keep the SSR injector and have the JS read
 `window.__avocadoOnlineUsers`, or keep the API field and drop the injector.
+
+---
+
+## §38. Performance, memory, and N+1 patterns
+
+Security review will flag exploitable bugs; performance review will flag the bugs that
+make the forum unusable at scale. **Reviewers grade an extension lower for one
+unbounded query on a hot path than for a closed-off admin-only RCE primitive** — the
+unbounded query degrades every page load for every actor. This section catalogs the
+five recurring shapes that have shown up across recent reviews.
+
+### 38.1 N+1 in Schema field `->get()` callbacks
+
+A `Schema\*::make(...)->get(fn (User $user, Context $ctx) => …)` callback runs **per
+row** in the response. On a 50-row admin user listing, one DB query inside the
+callback = 50 queries; with two such fields, 100. The reviewer who flagged
+`hasPendingVerificationRequest` on a verification extension wasn't wrong to call this
+"the worst pattern in the file" — it's invisible in code review (looks like one field)
+but quadratic at runtime.
+
+**Locate**:
+
+```bash
+rg -n "Schema\\\\(Str|Boolean|Integer|Arr|Number)::make.*->get\\(" src/
+```
+
+For each hit, ask: does the closure call `->where()`, `->first()`, `->count()`, or
+touch a relation that wasn't eager-loaded? If yes, it's an N+1.
+
+**Three correct shapes, in order of preference**:
+
+1. **Eager-load the relation** in a `ListResource`-style `eagerLoad` hook (Flarum v2 has
+   `Endpoint\Index::make()->eagerLoad('verificationRequests')`). Then the `get` closure
+   reads `$user->verificationRequests->isNotEmpty()` — no extra query.
+2. **Use a database column** instead of a derived flag. Maintain `users.has_pending_verification` via an Eloquent observer on `VerificationRequest::saved/deleted`. Trade write cost (1 update per state change) for read cost (N queries per listing) — almost always the right trade.
+3. **Use a `withCount` or `whereHas` on the parent query** so the count comes back as a column on the user row, then read `$user->verification_requests_count > 0` in the closure.
+
+**Anti-pattern (verification extension, paraphrased)**:
+
+```php
+// src/Api/UserResourceFields.php — runs ONE query per user row
+Schema\Boolean::make('hasPendingVerificationRequest')
+    ->get(function (User $user) {
+        return $this->db->table('verification_requests')
+            ->where('user_id', $user->id)
+            ->where('status', 'pending')
+            ->exists();                                          // ← N+1
+    }),
+```
+
+**Correct shape**:
+
+```php
+// 1. Add an Eloquent relation on User (via Extend\Model)
+(new Extend\Model(User::class))
+    ->hasMany('verificationRequests', VerificationRequest::class, 'user_id'),
+
+// 2. Eager-load on the listing endpoint
+Endpoint\Index::make()
+    ->can('administrate')
+    ->eagerLoad('verificationRequests'),
+
+// 3. Read the loaded collection — no extra query
+Schema\Boolean::make('hasPendingVerificationRequest')
+    ->get(fn (User $user) =>
+        $user->verificationRequests->contains(fn ($r) => $r->status === 'pending')
+    ),
+```
+
+The same fix dissolves the §10 "direct `ConnectionInterface` injection" smell: once
+`VerificationRequest` is a model with a `scopePending()`, neither the schema field nor
+the controller needs `$this->db` at all.
+
+### 38.2 Buffering full responses into PHP memory
+
+A controller that builds an export, reads the whole file with
+`file_get_contents`/`base64_encode`, then returns the string in a `Response` will
+**double-or-triple the file size in resident PHP memory**. On `memory_limit = 128M`
+(common shared-host default) and a 60 MB ZIP, the request hits OOM with a fatal error.
+Reviewers see this and rate the extension high-risk regardless of how clean the
+authorization is.
+
+**Locate**:
+
+```bash
+rg -n "base64_encode\\(file_get_contents|->getContents\\(\\)\\s*\\)|file_get_contents.*\\.zip" src/
+rg -n "->get\\(\\)\\s*->filter\\(|->all\\(\\)\\s*->filter\\(" src/   # PHP-side filter of full set
+```
+
+**Anti-patterns**:
+
+```php
+// Anti-pattern 1: base64 the whole file just to ship it
+$zipBytes = file_get_contents($zipPath);
+return new JsonResponse([
+    'filename' => 'stickers.zip',
+    'content'  => base64_encode($zipBytes),                      // ← 4 MB on disk → 16 MB in memory (orig + base64 + JSON-encoded)
+]);
+
+// Anti-pattern 2: load everything into memory to filter a subset
+$users = User::query()->where('approved', true)->get();          // ← 50k rows
+$tier1 = $users->filter(fn (User $u) => $u->tier_id === 1);      // ← PHP-side filter
+return new JsonResponse($tier1->take(20)->toArray());
+```
+
+**Correct shapes**:
+
+```php
+// Stream the file as an octet-stream response
+return new Response(
+    new \Laminas\Diactoros\Stream($zipPath, 'rb'),               // ← streaming, constant memory
+    200,
+    [
+        'Content-Type'        => 'application/zip',
+        'Content-Length'      => (string) filesize($zipPath),
+        'Content-Disposition' => 'attachment; filename="export.zip"',
+    ]
+);
+
+// Push filtering and pagination into the DB
+User::query()
+    ->where('approved', true)
+    ->where('tier_id', 1)                                        // ← SQL WHERE
+    ->orderBy('id')
+    ->limit(20)
+    ->get();
+```
+
+If the export format requires JSON-with-base64 (a frontend constraint you can't change
+right now), accept the design but **cap the input** so the worst-case never OOMs: refuse
+exports > N rows or > M MB on disk, return `413 Payload Too Large`, and document the
+limit.
+
+### 38.3 Missing compound indexes on multi-column WHERE
+
+A query that filters on two columns scans the table unless there's a compound index
+covering both. Single-column indexes don't compose — MySQL uses one per table per query.
+
+**Locate**:
+
+```bash
+rg -n "->where\\(.*->where\\(" src/         # chained where on same query
+rg -n "WHERE.*AND.*=" migrations/           # migrations that don't add a compound index
+```
+
+Then cross-reference each `WHERE a=? AND b=?` pattern against the migration's `$table->index([...])` calls. Single-column `$table->index('user_id')` does NOT cover `WHERE user_id=? AND status=?`.
+
+**Correct shape**:
+
+```php
+// In the migration that creates `verification_requests`
+$table->index(['user_id', 'status'], 'verification_requests_user_status_idx');
+
+// In a follow-up migration if the table already exists in production
+Schema::table('verification_requests', function (Blueprint $table) {
+    $table->index(['user_id', 'status'], 'verification_requests_user_status_idx');
+});
+```
+
+The order in the compound index matters: put the higher-cardinality column first
+(`user_id` usually, since `status` only has a handful of distinct values). For a query
+that filters by `status` first and `user_id` second, you'd need a different ordering or
+a second index — though the same table almost never needs both.
+
+### 38.4 Large blobs in `serializeToForum`
+
+`->serializeToForum(...)` ships the value in **every** forum-page bootstrap payload,
+**every** API root response, and **every** SPA reload. A 256 KB SVG (admin-uploaded
+badge) means 256 KB × every page view × every actor. On a community doing 100k page
+views/day this is **25 GB/day** of bandwidth for a single decorative asset, and it
+adds ~50 ms of parse time to every initial paint on slow mobile connections.
+
+**Locate**:
+
+```bash
+rg -n "serializeToForum\\(" extend.php src/
+```
+
+For each hit, ask:
+1. Is the value a small scalar/boolean/short string? → fine.
+2. Is it user-controlled or admin-controlled HTML/SVG/JSON? → §21 covers sanitization; here ask **how big can it get?** If unbounded or > 4 KB, **don't `serializeToForum` it**.
+3. Is it consumed only by one route? → expose via that route's `ApiResource` field, not the global payload.
+
+**Correct shape for admin-uploaded SVG badges**:
+
+```php
+// BAD — entire SVG in every forum-page payload
+->serializeToForum('verifiedBadgeSvg', 'verified.badge_svg', null, '')
+
+// GOOD — serve via a dedicated public URL and ship only the URL
+(new Extend\Routes('forum'))
+    ->get('/ext/verified/badge.svg', 'verified.badge', BadgeController::class);
+
+// Then in the resource that needs it:
+Schema\Str::make('verifiedBadgeUrl')
+    ->get(fn () => $this->url->to('forum')->route('verified.badge'))
+```
+
+The SVG is cached by the browser, served with `Cache-Control: public, max-age=31536000`,
+and the forum-page payload stays small. **Trade**: one extra HTTP request per fresh
+visitor; for a 256 KB asset that's a clear win.
+
+### 38.5 PHP-side filtering of full result sets
+
+If a query returns all matching rows just to drop most of them in PHP, the query is
+wrong. Push the filter into SQL with `where()`, `whereIn()`, or a proper
+relationship-based `whereHas()`. Reviewers flag this as low severity — the worst case
+is "slow", not "broken" — but it compounds with §38.1 N+1 and §38.2 buffering when
+they appear together.
+
+**Common shape**:
+
+```php
+// Anti-pattern (tier filter from a verification-style extension)
+$users = User::query()->get();                                   // 50k rows
+$tier1 = $users->filter(fn ($u) => $this->resolveTierId($u) === 1);  // PHP-side
+$page  = $tier1->slice($offset, $limit);
+
+// Correct
+User::query()
+    ->where('tier_id', $tierId)                                  // SQL
+    ->orderBy('id')
+    ->offset($offset)->limit($limit)
+    ->get();
+```
+
+If the filter depends on logic that cannot be expressed in SQL (e.g., parsing a JSON
+column with a complex schema), persist a denormalized column at write time and filter
+on that — never make every read pay the parsing cost.
+
+### 38.6 Helper logic duplicated between Schema getter and controller
+
+When a `Schema\*->get(fn ... => $this->resolveX($user))` and a controller both contain
+the same `resolveX` logic, the next bug is **drift** — one place gets a fix, the other
+doesn't. The fix is structural: put the logic on the **model** as an accessor
+(`getXAttribute` / `Attribute::make`) or a method, so both call sites read the same
+implementation. Reference smell: `resolveTierId` duplicated between
+`UserResourceFields` and `ListApprovedUsersController` in a verification-style extension.
+
+---
+
+## §39. Flarum version compatibility & portability
+
+### 39.1 `composer.json` constraint must match the API surface the code uses
+
+Flarum 2.x introduced a new API resource layer (`Flarum\Api\Resource\AbstractDatabaseResource`,
+`Flarum\Api\Schema\*`, `Flarum\Api\Endpoint\*`) that **does not exist on 1.x**. An
+extension that imports those classes but ships `"flarum/core": "^1.0 || ^2.0"` in
+`composer.json` will install cleanly on a 1.x forum and then fatal-error on enable.
+
+**Locate**:
+
+```bash
+# Does the code use v2-only classes?
+rg -n "use Flarum\\\\Api\\\\(Resource|Schema|Endpoint|Context|Sort|Include_)" src/
+
+# What does the manifest claim?
+rg -n "\"flarum/core\"" composer.json
+```
+
+**Rules**:
+- If `src/` uses any class under `Flarum\Api\Resource`, `Flarum\Api\Schema`, `Flarum\Api\Endpoint`, `Flarum\Api\Context` → constraint MUST be `"flarum/core": "^2.0"` (no `^1.0`).
+- If you want **dual-version support**, you need two code paths, two extender sets in `extend.php`, and runtime detection via `\Composer\InstalledVersions::satisfies(...)`. This is rarely worth the complexity — almost every extension should commit to one major version.
+- The `flarum-extension.json` (legacy) and `extra.flarum-extension` block in `composer.json` must agree with the constraint.
+- Don't claim v1 compatibility "just in case" — reviewers and `flarum/extension-manager` enforce the constraint, and the white-screen fatal on activation is a much worse failure mode than a clear "requires Flarum 2.x" install error.
+
+**Migration class deltas** (the v1 → v2 surfaces that LLMs reach for by reflex):
+
+| v1 only | v2 only | Both (no rename) |
+|---|---|---|
+| `Flarum\Api\Serializer\AbstractSerializer` | `Flarum\Api\Resource\AbstractDatabaseResource` | `Flarum\User\User` |
+| `Flarum\Api\Controller\AbstractCreate/Show/List/Update/Delete*` | `Flarum\Api\Endpoint\Create/Show/Index/Update/Delete::make()` | `Flarum\Foundation\AbstractValidator` |
+| `Flarum\Extend\ApiSerializer/ApiController` | `Flarum\Api\Schema\Str/Boolean/Integer/Arr/Relationship` | `Flarum\Extend\Routes/Middleware/Policy/Settings/Locales` |
+| (n/a) | `Flarum\Api\Context` (handler arg) | `Flarum\User\Access\AbstractPolicy` |
+
+### 39.2 Database portability — no MySQL-only SQL in migrations
+
+Flarum officially supports **MySQL/MariaDB and PostgreSQL**, with SQLite for tests.
+Direct `INFORMATION_SCHEMA` queries, `RAND()` (`RANDOM()` on PG/SQLite), `FROM_UNIXTIME`,
+`GROUP_CONCAT`, MyISAM-specific DDL, and the JSON syntax variants are all portability
+hazards.
+
+**Locate**:
+
+```bash
+rg -n "INFORMATION_SCHEMA|FROM_UNIXTIME|GROUP_CONCAT|RAND\\(\\)" migrations/ src/
+rg -n "ENGINE=|->engine\\(" migrations/
+```
+
+**Correct shape**:
+
+```php
+// Anti-pattern — works on MySQL, fails on PostgreSQL
+$db->select("SELECT COUNT(*) FROM INFORMATION_SCHEMA.STATISTICS WHERE TABLE_NAME = 'x' AND INDEX_NAME = 'y'");
+
+// Portable — Laravel Schema Builder works on both
+use Illuminate\Database\Schema\Builder;
+return [
+    'up' => function (Builder $schema) {
+        if (! $schema->hasTable('verification_requests')) return;
+        if ($schema->getConnection()->getDoctrineSchemaManager()
+                ->listTableIndexes('verification_requests')['idx_user_status'] ?? null) return;
+        $schema->table('verification_requests', function ($table) {
+            $table->index(['user_id', 'status'], 'idx_user_status');
+        });
+    },
+];
+```
+
+If you genuinely need a database-vendor-specific feature, gate it on the connection
+driver: `if ($schema->getConnection()->getDriverName() === 'mysql') { … }`.
+
+### 39.3 Eloquent first, `ConnectionInterface` second
+
+Reiterating §10: prefer an Eloquent model. The convention smell flagged in reviews is
+not "you used the DB" — it's "you injected a low-level abstraction when a higher-level
+one was already wired by Flarum". Reach for `ConnectionInterface` only for truly raw
+work (bulk insert, cross-connection queries, vendor-specific SQL gated as in §39.2).
+Most "needs raw SQL" cases dissolve into `Model::query()->whereHas(...)->withCount(...)`.
+
+---
+
+## §40. Frontend robustness, TS discipline, CSS targeting
+
+This section collects the JS/TS/CSS patterns that reviewers consistently flag as
+low/medium severity. Individually each is trivial; collectively they're what drives
+quality scores from 94 down to 67.
+
+### 40.1 `JSON.parse` on XHR responses must be wrapped
+
+```ts
+// BAD — bare parse, ANY non-JSON response (HTML error page, gateway timeout)
+// becomes an uncaught exception that the user never sees.
+xhr.onload = () => {
+    const data = JSON.parse(xhr.responseText);                   // ← throws SyntaxError
+    onSuccess(data);
+};
+
+// GOOD
+xhr.onload = () => {
+    let data: unknown;
+    try { data = JSON.parse(xhr.responseText); }
+    catch (e) {
+        app.alerts.show({ type: 'error' },
+            app.translator.trans('myext.import.parse_error'));
+        return;
+    }
+    onSuccess(data);
+};
+```
+
+The same rule applies to `await response.json()` in `fetch` — wrap it. The browser will
+NOT show the user a meaningful error otherwise; they just see a button that did
+nothing.
+
+### 40.2 User-visible error UI on every async failure
+
+Every `.catch(...)`, every `try/catch` around an `await`, every XHR `onerror` must
+surface something — `app.alerts.show({type:'error'}, …)`, a toast, an inline error
+state on the form. Returning silently from a failure is worse than throwing: the user
+clicks "Save", nothing happens, they click again, eventually the form is in an
+unknowable state. Reviewers flag this as `robustness` and it accumulates.
+
+```ts
+// BAD
+async function save() {
+    try { await app.request({…}); this.dismiss(); }
+    catch { /* swallowed */ }
+}
+
+// GOOD
+async function save() {
+    this.loading = true;
+    try {
+        await app.request({…});
+        this.dismiss();
+    } catch (e) {
+        this.loading = false;
+        const msg = e?.response?.errors?.[0]?.detail
+            ?? app.translator.trans('myext.save_failed');
+        app.alerts.show({ type: 'error' }, msg);
+        m.redraw();
+    }
+}
+```
+
+### 40.3 DOM queries — scope to `this.element`, never `document`
+
+```ts
+// BAD — picks the FIRST .Button-Sticker anywhere in the document, often the wrong one
+const button = document.querySelector('.Button-Sticker');
+
+// GOOD — scope to the component's own DOM
+const button = this.element.querySelector('.Button-Sticker');
+
+// BETTER — use Mithril refs / element bindings; touching the DOM at all is a smell
+```
+
+In a Flarum SPA, multiple component instances coexist on the same page. A reply form
+above the composer and one inside the composer both render `.Button-Sticker`. A
+`document.querySelector` will reach for whichever the DOM happens to list first, which
+is a hidden coupling to render order. Reviewers flagged exactly this pattern in a
+sticker-style extension.
+
+### 40.4 `as any` — prefer module augmentation
+
+`as any` casts bypass TypeScript silently. They surface as "low" severity in review
+but accumulate into "we can't safely refactor this file" debt.
+
+```ts
+// BAD
+(MyClass.prototype as any).newMethod = function () {…};
+
+// GOOD — augment the type
+declare module 'flarum/forum/components/MyClass' {
+    export default interface MyClass {
+        newMethod(): void;
+    }
+}
+MyClass.prototype.newMethod = function () {…};
+```
+
+For tag-type extensions adding attributes to core models, augment the model class:
+
+```ts
+declare module 'flarum/common/models/User' {
+    export default interface User {
+        isVerified(): boolean;
+        verifiedBadgeUrl(): string | null;
+    }
+}
+```
+
+### 40.5 Modern CSS — check Flarum's browserslist before shipping
+
+Flarum 1.x has a wider browser target than 2.x. Features like `color-mix()`,
+`:has()`, container queries, and the `oklch()` color space are not universally
+supported across the target list. **If the feature degrades gracefully** (fallback to
+a static color), ship it. If it doesn't degrade (the rule disappears entirely), provide
+a fallback first:
+
+```less
+.Button {
+    // Fallback — works everywhere
+    background: darken(@primary-color, 10%);
+
+    // Progressive enhancement — used when supported
+    @supports (background: color-mix(in srgb, red, blue)) {
+        background: color-mix(in srgb, @primary-color 90%, black);
+    }
+}
+```
+
+Reviewers will downgrade for a missing fallback that breaks hover/active states on
+Safari/older Chromium even though the feature is "broadly available" per caniuse.
+
+### 40.6 Hardcoded list truncation must surface to the user
+
+```ts
+// BAD — silently drops anything past 500
+const visible = stickers.slice(0, 500);
+
+// GOOD — page through, or show the count
+const PAGE = 500;
+const visible = stickers.slice(0, PAGE);
+if (stickers.length > PAGE) {
+    items.add('overflow-note',
+        <p className="muted">{app.translator.trans('myext.showing_n_of_m',
+            { n: PAGE, m: stickers.length })}</p>);
+}
+```
+
+If 500 is enough for any realistic install, document it; if not, paginate or virtualize.
+**Silent truncation** is the worst option: users on a 600-sticker library think their
+last 100 stickers were deleted.
+
+### 40.7 Helper deduplication across components
+
+```bash
+# Find the same function defined in multiple files
+rg -n "function isLottiePath|const isLottiePath|function isTgsPath|const isTgsPath" js/src/
+```
+
+When the same helper appears in 3 files, extract it to `js/src/common/utils/<name>.ts`
+and `export`. Reviewers flag this as `technical debt`; the real cost surfaces when one
+copy fixes a bug and the other two don't.
+
+### 40.8 Unreachable CSS — feature blocks for code paths that don't ship
+
+```bash
+# CSS rules referencing class names that no JS/PHP emits
+rg -n "\\.MyExt-coloredHeader|\\.MyExt-experimental" less/ src/
+```
+
+A `.less` block targeting `.MyExt-coloredHeader` only matters if some component renders
+that class. If grep against `js/src/` and templates returns zero hits, the CSS is dead
+weight — and worse, the next reader assumes the feature exists and looks for the JS
+that wires it. Delete the block; if the feature is planned, put it on a branch.
+
+---
+
+## §41. Logging discipline — PSR-3 `LoggerInterface`, never `Facades\Log`
+
+Flarum binds `Psr\Log\LoggerInterface` to a rotating-file logger out of the box. Inject
+it — don't reach for `Illuminate\Support\Facades\Log`. The Facade only works because
+Flarum boots a Laravel container; it adds a hidden global dependency, breaks under
+tests that don't boot the facade root, and obscures the dependency graph.
+
+**Locate**:
+
+```bash
+rg -n "use Illuminate\\\\Support\\\\Facades\\\\Log|\\\\Log::" src/
+rg -n "use Psr\\\\Log\\\\LoggerInterface" src/
+```
+
+**Anti-pattern (pervasive, recently flagged)**:
+
+```php
+use Illuminate\Support\Facades\Log;
+class MyHandler {
+    public function handle(...): ResponseInterface {
+        Log::info('user did thing', ['actor' => $actor->id]);    // ← global facade
+    }
+}
+```
+
+**Correct shape**:
+
+```php
+use Psr\Log\LoggerInterface;
+class MyHandler {
+    public function __construct(private LoggerInterface $log) {}
+    public function handle(...): ResponseInterface {
+        $this->log->info('user did thing', ['actor' => $actor->id]);
+    }
+}
+```
+
+When the class is a singleton/handler resolved by the container, Flarum injects the
+logger automatically. For values that flow through queued jobs, the job's `handle()`
+gets the same container resolution — same shape.
+
+Re-read §23 for **what** to log (don't log request bodies, headers, tokens). This
+section is about **how** to obtain the logger.
 
 ---
 
