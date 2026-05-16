@@ -65,6 +65,13 @@ Base Github: https://github.com/ram0ng1/verified, https://github.com/ram0ng1/avo
 - §46 **Event listener / blueprint subject-type contracts** — subject must match the type the consumer expects; polymorphic `subject_type`/`subject_id` integrity; recipient filters on `beforeSending`
 - §47 **Admin-controlled execution surfaces** — `createContextualFragment`, settings-as-`<script>`, `style.innerHTML` interpolation, custom-JS/custom-CSS settings panels
 - §48 **Review report output contract** — when finishing a `/review` or `/security-review`, ask before emitting; required fields (timestamp, quality score, vibe-coded score, executive summary, findings table); scoring rubric; verdict thresholds (≥80 approved, ≥75 with concerns, <75 not for production)
+- §49 **Cryptographic key material persisted in the `settings` table** — never write a private key in plaintext base64; default to envelope-encryption with a per-install derived key; refuse to persist when the host lacks the required AEAD primitive
+- §50 **Synchronous heavy work in request handlers** — file post-processing, multi-step Stripe sync, archive extraction must dispatch to the queue with a `processing_status` column; the controller returns immediately
+- §51 **Estilo de comentário — Flarum core, em PT-BR** — só docblocks, em PT-BR, curtos, só onde o código não fala sozinho; NUNCA `//` inline (separadores, trailing, ou standalone)
+- §52 **No env vars in extensions** — gate features off `config.php`'s `'debug' => true/false` via `Flarum\Foundation\Config`; never read `.env` or `getenv()` directly
+- §53 **Handlers gordos** — `handle()` acima de ~100 linhas é refator obrigatório; extraia gates, validators, builders para `src/Service/<Domain>/`
+- §54 **Laravel Filesystem vs I/O nativo** — sempre `Illuminate\Contracts\Filesystem\Factory`; exceções (ZipArchive, php_strip_whitespace) ficam isoladas e usam `Flarum\Foundation\Paths` no construtor, jamais `sys_get_temp_dir`
+- §55 **Pinning de SDK externo** — não fixe versão de API de SDK sem compat layer + plano de migração; deixar o pin estagnado vira technical-debt time-bomb
 
 ---
 
@@ -1693,6 +1700,56 @@ on a single `Schema\Str::make('nickname')` —
 
 ## §26. Migrations
 
+**Prefer the `Flarum\Database\Migration` helpers** over raw `'up' => fn (Builder $schema)
+=> $schema->create(...)` arrays. The helpers cover the common shapes (`createTable`,
+`createTableIfNotExists`, `addColumns`, `dropColumns`, `renameColumn(s)`, `addSettings`,
+`addPermissions`) and bring idempotency + portable down handlers for free:
+
+```php
+<?php
+
+use Flarum\Database\Migration;
+use Illuminate\Database\Schema\Blueprint;
+
+return Migration::createTableIfNotExists('myext_items', function (Blueprint $table) {
+    $table->id();
+    $table->string('title', 100);
+    $table->foreign('user_id')->references('id')->on('users')->cascadeOnDelete();
+});
+
+// Adding columns to an existing table. NOTE the `length` key — Laravel's
+// addColumn() only reads NAMED options, so `['string', 20, ...]` silently
+// loses the length and produces `varchar()` (invalid MySQL DDL).
+return Migration::addColumns('myext_items', [
+    'reviewed_at' => ['dateTime', 'nullable' => true],
+    'priority'    => ['integer', 'default' => 0, 'after' => 'status'],
+    'status'      => ['string',   'length' => 20, 'nullable' => true],
+]);
+```
+
+The raw `'up' => fn (Builder $schema) => ...` form is still valid (Flarum accepts
+both) but only worth it when the helper can't express the operation: dropping a
+unique index alongside the column, data backfills, driver-gated raw SQL. For
+everything else, the helper is the convention — newcomers recognise the shape and
+the portability across MySQL/PostgreSQL/SQLite is enforced by Flarum itself.
+
+### Critical pitfall — `length` must be a named key
+
+```php
+// BAD — `20` lands at index 0; addColumn() ignores numeric keys; MySQL gets
+// `add `status` varchar() null` and the migration crashes at runtime.
+'status' => ['string', 20, 'nullable' => true],
+
+// GOOD — named key reaches the Blueprint as the column's length.
+'status' => ['string', 'length' => 20, 'nullable' => true],
+```
+
+If the column needs precise control (decimal precision, enum values, raw type
+expression), drop the helper for that one migration and use the raw closure
+form below — don't try to bend the helper.
+
+### Raw form (use only when the helper can't express it)
+
 ```php
 <?php
 use Illuminate\Database\Schema\Blueprint;
@@ -2060,6 +2117,32 @@ flarum-gdpr:
         anonymize_description: "IP address, user-agent, and free-text notes will be cleared on each audit entry. The entry itself is retained for forum integrity."
         delete_description: "Every audit entry attributed to your account is permanently deleted."
 ```
+
+**Gotcha**: when the subclass does **not** override `dataType()`, the default
+implementation in `Flarum\Gdpr\Data\Type` returns the short class name
+(`Str::afterLast(static::class, '\\')`). A class named `MarketplaceUserData`
+ships keys under `flarum-gdpr.lib.data.marketplaceuserdata.*` — not under your
+extension's namespace. Easy to miss because grep for the key inside your
+extension's `locale/<lang>.yml` returns nothing until you add the second root.
+
+The yaml file ends up with TWO root keys side by side:
+
+```yaml
+ramon-marketplace:
+  forum: { ... }
+  admin: { ... }
+
+flarum-gdpr:
+  lib:
+    data:
+      marketplaceuserdata:
+        export_description: "..."
+        anonymize_description: "..."
+        delete_description: "..."
+```
+
+YAML supports multiple top-level documents — both roots resolve via the
+extension's `Extend\Locales(__DIR__.'/locale')` registration.
 
 If your data type's `anonymize` and `delete` produce the same result, follow the
 `Discussions` pattern — override `anonymizeDescription()` to call `deleteDescription()`
@@ -5428,6 +5511,739 @@ If you find yourself uncertain about a score, anchor against these published rev
 
 If your scoring lands materially outside these anchors, re-check the rubric — you
 likely under- or over-weighted a finding.
+
+---
+
+## §49. Cryptographic key material persisted in the `settings` table
+
+**CWE-312.** Any private key, HMAC secret, OAuth refresh token, signing seed, or
+session-encryption material stored in the `settings` table is **plaintext at rest**.
+A SQL injection elsewhere in the stack, a leaked backup, a phpMyAdmin exposure on
+shared hosting, or a compromised admin browser session reading the settings page
+all surface the secret. The forum's own `password_reset_token` etc. live in
+dedicated tables with TTL — `settings` has no such hardening.
+
+### Red flags
+
+```bash
+rg -n "settings->set\\(.*key|sign|secret|hmac" src/
+rg -n "settings->get\\(.*key|sign|secret" src/
+```
+
+Any `Settings::set('myext.sig_key', base64_encode(...))` is the bug.
+
+### Correct shape
+
+1. **Envelope-encrypt before persisting** with XChaCha20-Poly1305 (or AES-GCM)
+   using a key derived deterministically from `Flarum\Foundation\Config`. The
+   stable per-install inputs are `$config['url']` and `$config['paths']['base']`,
+   hashed: `hash('sha256', 'salt|'.$url.'|'.$path, true)`.
+2. **Refuse to persist** if the host lacks the AEAD primitive
+   (`function_exists('sodium_crypto_aead_xchacha20poly1305_ietf_encrypt')`).
+   Throwing a RuntimeException with operator-facing instructions is the right
+   response — a silent plaintext fallback is the bug being prevented.
+3. **Accept legacy plain blobs on read** (so existing installs don't lose their
+   key on upgrade) but **rewrite to the envelope format on first decode**, so
+   the plaintext doesn't linger past the next read.
+4. **Never read an env var.** See §52. Flarum operators don't set `.env`; the
+   only persistent install-level configuration source is `config.php` plus the
+   `settings` table.
+
+### Anti-patterns that re-introduce the bug
+
+- Reading an env var like `MYEXT_KEY_ENC` and **falling back to plaintext**
+  when it's absent. The fallback is the vulnerability.
+- Using `random_bytes()` as the envelope key and storing it next to the encrypted
+  payload. Persisting both makes the encryption a no-op.
+- Symmetric envelope key reused across installs ("hardcoded in the source"). The
+  threat model includes attackers who can read your source.
+
+### Reference shape
+
+The marketplace extension's `src/Service/LicenseSigner.php`: plaintext on disk
+is impossible — `encode()` throws if libsodium lacks AEAD, and `envelopeKey()`
+throws if `Config` has no `url` or `paths.base`.
+
+---
+
+## §50. Synchronous heavy work in request handlers
+
+A controller that calls into a service taking 30+ seconds (archive extraction,
+multi-row Stripe sync, image transcoding, multi-step license verification) will
+**hit PHP-FPM's `request_terminate_timeout` and leave the system in a partial
+state** with no error surfaced to the admin. The upload moved before processing
+started, so the raw file lives on disk; the DB row may have been written but
+without the post-processing flag; the queue worker, if there is one, never sees
+the task. The admin clicks "Save", spinner runs forever, eventually they refresh.
+
+### Locate
+
+```bash
+rg -n "set_time_limit|ini_set\\('max_execution_time" src/
+rg -n "->process\\(|->extract\\(|->transcode\\(|->resize\\(|->compile\\(" src/Api/Controller/
+rg -n "->process\\(|->extract\\(" src/Service/ -l
+# For each handler-side hit: is the call surrounded by a queue dispatch?
+rg -n "ShouldQueue|::dispatch\\(" src/
+```
+
+A controller that calls a heavy service inline and ALSO does not implement
+`ShouldQueue` is a finding.
+
+### Correct shape
+
+1. **Persist the record with `processing_status = 'queued'`** as the first DB
+   write. The controller returns 201 with the row's ID before the work starts.
+2. **Dispatch a job (`implements ShouldQueue`)** that does the heavy work. The
+   job updates `processing_status` (`processing` → `ready` | `failed`).
+3. **Frontend polls** the resource for status changes; admin sees an
+   "in progress" indicator instead of a hung spinner.
+
+```php
+class UploadController {
+    public function handle(...) {
+        $record = MyModel::create([
+            ...,
+            'processing_status' => 'queued',
+        ]);
+        ProcessUploadJob::dispatch($record->id, $tempFilePath, $opts);
+        return new JsonResponse(['data' => ['id' => $record->id, 'processing_status' => 'queued']], 201);
+    }
+}
+
+class ProcessUploadJob implements ShouldQueue {
+    public int $tries = 1;
+    public int $timeout = 600;
+    public function handle(MyProcessor $processor) {
+        $record = MyModel::find($this->id);
+        $record->update(['processing_status' => 'processing']);
+        try {
+            $processor->process(...);
+            $record->update(['processing_status' => 'ready', 'processing_error' => null]);
+        } catch (\Throwable $e) {
+            $record->update(['processing_status' => 'failed', 'processing_error' => mb_substr($e->getMessage(), 0, 1000)]);
+            throw $e;
+        }
+    }
+}
+```
+
+### `sync` queue driver caveat
+
+Flarum's default queue driver is `sync` — the job runs **inline** in the request.
+Going from `inline call` to `Job::dispatch(...)` doesn't, by itself, eliminate
+the timeout risk on a default install — it just moves the code path. The real
+async behavior surfaces only when the operator configures a non-sync driver
+(`redis`, `database`, `sqs`).
+
+The structural change is still worth it:
+- The controller doesn't take ANY return value from the job — it returns
+  immediately based on the queued row. Even on `sync`, the response shape is
+  consistent with what the async driver delivers.
+- Document in the extension README that production deployments must configure a
+  real queue driver to get the async benefit.
+- Persistence of `processing_status` survives even on `sync` — failures surface
+  via the `failed` state instead of as a 500.
+
+### Repush / re-notify pattern
+
+When the heavy work is "tell N other systems about a state change" (license
+revocation push, webhook fan-out), pair the dispatcher with a per-record
+`notified_at` column and a cooldown:
+
+```php
+$cutoff = Carbon::now()->subHours(24);
+$pending = Subscription::query()
+    ->whereNotNull('license_revoked_at')
+    ->whereNotNull('license_domain')
+    ->where(fn ($q) => $q->whereNull('revoke_notified_at')->orWhere('revoke_notified_at', '<', $cutoff))
+    ->limit(200)
+    ->get();
+```
+
+Without the `revoke_notified_at` filter, an hourly cron iterating "every
+revoked record" grows linearly with the lifetime of the marketplace and ends up
+hammering 10,000 endpoints per hour for records that were notified successfully
+a year ago. With the filter, work per tick is bounded.
+
+### Stripe-style batch pagination
+
+For "reconcile local state with provider state" jobs, **never fetch per-row**
+when the provider exposes a list endpoint. Stripe's
+`subscriptions.list(['limit' => 100])` returns a page; the next page is keyed by
+`starting_after = $lastItem->id`. Index local records by the provider ID and
+intersect with the returned page — one API call per 100 records instead of
+per-record.
+
+```php
+$locals = Subscription::query()
+    ->whereNotNull('stripe_subscription_id')
+    ->get()
+    ->keyBy('stripe_subscription_id');
+
+$startingAfter = null;
+do {
+    $page = $stripe->listSubscriptions($startingAfter, 100);
+    foreach ($page->data as $remote) {
+        if ($local = $locals->get($remote->id)) {
+            $this->reconcile($local, $remote);
+        }
+    }
+    $startingAfter = $page->has_more ? end($page->data)->id : null;
+} while ($startingAfter !== null);
+```
+
+A 6,000-record sync goes from ~60 seconds (per-row) to ~3 seconds (batched).
+
+---
+
+## §51. Estilo de comentário — Flarum core, em PT-BR
+
+Comentários neste codebase seguem **exatamente** a lógica de comentário usada
+no core do Flarum e nas extensões oficiais (`flarum/tags`, `flarum/likes`,
+`flarum/mentions`, `flarum/suspend`, `flarum/gdpr`). A regra é simples:
+
+> **Só docblocks. Em PT-BR. Curtos. Só onde explica algo que o código não
+> consegue dizer sozinho.**
+
+### A diretriz absoluta — sem `//` inline
+
+Esta extensão **não usa** comentários de linha (`//`). Nem em separadores
+visuais (`// ── seção ──`), nem em pequenas notas (`// nota`), nem trailing
+(`$x = 1; // comentário`). Se algo precisa de explicação, é porque a *unidade*
+precisa de docblock — não um pedacinho dela.
+
+Por que esse rigor? O reviewer "vibe-coded" pontua alto qualquer arquivo com
+muitos `//` espalhados, e Flarum-core também usa `//` parcimoniosamente. Vetar
+totalmente é uma regra mais fácil de auditar e produz código quase
+indistinguível do estilo das extensões oficiais.
+
+### Onde Flarum-core coloca docblock — e onde NÃO coloca
+
+Olhando `vendor/flarum/core/src/User/User.php`, `vendor/flarum/tags/src/Tag.php`,
+`vendor/flarum/likes/src/Notification/PostLikedBlueprint.php`:
+
+| Local | Tem docblock? | Conteúdo típico |
+|---|---|---|
+| Modelos Eloquent (classe) | **Sim** | Bloco `@property` puro, sem prose |
+| Service / Handler (classe) | **Só se não-óbvio** | 1–4 linhas dizendo *o que* o serviço faz |
+| Resource / Endpoint (classe) | Não | O nome já diz tudo |
+| Listener (classe) | **Só se há side effect importante** | 1 linha |
+| Constantes (`public const`) | **Só se "por que esse valor"** | 1 linha |
+| Métodos `boot()`, `getRules()`, hooks framework | **Sim** | 1 linha (`Boot the model.`) |
+| Relations (`belongsTo`, `hasMany`) | Não | Self-explicativo |
+| Getters/setters triviais | Não | Self-explicativo |
+| `@param`/`@return` quando o tipo basta | **Não** | Redundante |
+| `@param`/`@return` com array de shape específico | **Sim** | `array{key: type}` |
+| Método de regra de negócio com invariante sutil | **Sim** | 1–3 linhas explicando *por quê* |
+
+### A regra concreta
+
+Adicione um docblock quando, e SOMENTE quando, ao menos uma destas for verdade:
+
+1. **A classe é um modelo Eloquent** — coloque um `@property` block.
+2. **A classe ou método tem um contrato não-óbvio** — invariante, side-effect,
+   retorno em shape específico, ordem de operações importa.
+3. **O método é um override de framework** que precisa sinalizar intenção
+   (`boot()`, `getRules()`, etc.) — uma linha basta.
+4. **A constante tem um valor decidido por razões não-óbvias** — explique em
+   uma linha.
+
+Em **todos os outros casos**, o código fica sem comentário. O nome da classe,
+o nome do método, a assinatura tipada e a estrutura do código dizem o resto.
+
+### Formato exato
+
+Docblock PT-BR no estilo Flarum:
+
+- Abre com `/**` em linha própria.
+- Cada linha de prose: `     * Texto.` (asterisco alinhado, ponto final).
+- Linhas em branco internas: `     *`.
+- Fecha com `     */` em linha própria.
+- 1 a 4 linhas de prose. **Nunca um parágrafo de prose.**
+- `@param`/`@return`/`@throws` só quando agregam informação além da signature.
+- Imperativo na primeira pessoa do plural ou descritivo na 3ª pessoa, ambos
+  aceitos. Sempre verbo de ação na primeira palavra: *"Devolve…"*, *"Cria…"*,
+  *"Atualiza…"*, *"Garante…"*, *"Recusa…"*.
+
+### Exemplos lado a lado
+
+**RUIM** — comentários `//` espalhados:
+
+```php
+public function process(string $zipPath): array
+{
+    if (! is_file($zipPath)) {
+        throw new \RuntimeException('ZIP não existe');
+    }
+
+    // Storage privado em vez de /tmp shared
+    $tmpDir = $this->resolveTmpBase() . '/mp_zip_' . bin2hex(random_bytes(8));
+
+    // Validação anti zip-slip
+    $hasBackslash = $this->validateZipEntries($zip);
+
+    // Roda apenas após o stripping
+    $integrityResult = $this->integrity->inject($extensionRoot);
+}
+```
+
+**BOM** — sem `//`, docblock no método quando o WHY merece:
+
+```php
+/**
+ * Pós-processa um ZIP recém-enviado: valida entries, extrai, injeta o stub
+ * de licença e re-empacota. Falha em qualquer violação de segurança aborta
+ * com `RuntimeException` sem deixar resíduo em disco.
+ */
+public function process(string $zipPath): array
+{
+    if (! is_file($zipPath)) {
+        throw new \RuntimeException('ZIP não existe');
+    }
+
+    $tmpDir = $this->resolveTmpBase() . '/mp_zip_' . bin2hex(random_bytes(8));
+    $hasBackslash = $this->validateZipEntries($zip);
+    $integrityResult = $this->integrity->inject($extensionRoot);
+}
+```
+
+**RUIM** — docblock redundante:
+
+```php
+/**
+ * Devolve o id do usuário.
+ *
+ * @return int
+ */
+public function getId(): int
+{
+    return $this->id;
+}
+```
+
+**BOM** — sem docblock; o nome + a signature dizem tudo:
+
+```php
+public function getId(): int
+{
+    return $this->id;
+}
+```
+
+**BOM** — modelo Eloquent com `@property` block:
+
+```php
+/**
+ * @property int $id
+ * @property int $user_id
+ * @property string $status
+ * @property \Carbon\Carbon|null $current_period_end
+ */
+class Subscription extends AbstractModel
+{
+    protected $table = 'marketplace_subscriptions';
+    // ...
+}
+```
+
+**BOM** — método com contrato não-óbvio:
+
+```php
+/**
+ * Cifra o par Ed25519 com envelope AEAD. Recusa persistir quando o host não
+ * suporta a primitiva — fallback plaintext é exatamente o bug evitado.
+ */
+protected function encode(string $binary): string
+{
+    // ...
+}
+```
+
+### O que NUNCA fazer
+
+- Comentário `//` em qualquer forma (standalone, trailing, separador).
+- Docblock que só repete o que o nome ou a signature já diz.
+- Docblock multi-parágrafo (> 4 linhas de prose). Se precisar disso, vire no
+  README ou no PR.
+- Referência `CLAUDE.md §X` dentro do código — vira ruído quando a numeração
+  muda.
+- TODO / FIXME / XXX sem link para uma issue do GitHub.
+- `@param string $name` quando a signature já tem `string $name`.
+
+### Lint de disciplina (rode antes de commitar)
+
+```bash
+# Qualquer `//` é violação automática.
+rg -n '//' src/ extend.php migrations/ | grep -vE '\.com//|http:|https:|ftp:|://[a-z]' | head
+
+# Docblocks com > 5 linhas (potencialmente prose).
+rg -nU "^\\s*/\\*\\*\\s*\\n(\\s*\\*[^\\n]*\\n){5,}\\s*\\*/" src/
+
+# Referências CLAUDE.md no código (sempre suspeitas).
+rg -n 'CLAUDE\.md' src/ extend.php migrations/
+```
+
+Os três comandos devem retornar zero matches num codebase em compliance.
+
+### Quando o nome do método é estrangeirismo
+
+Termos do domínio Stripe (`webhook`, `checkout`, `subscription`, `refund`),
+de pacotes (`composer`, `package`), de framework (`middleware`, `policy`,
+`extender`) **continuam em inglês** dentro da prose PT-BR. Não traduza
+"webhook" para "gancho", nem "refund" para "reembolso de pagamento". O leitor
+do código é um dev que conhece o vocabulário; forçar a tradução prejudica a
+leitura.
+
+```php
+/**
+ * Constrói a Stripe Checkout Session em modo subscription.
+ */
+public function createSubscriptionSession(Order $order): StripeSession
+```
+
+### O que esta seção NÃO é
+
+- Não é "delete todo comentário". Docblocks que pagam aluguel ficam.
+- Não é "reescreva CLAUDE.md no PHP". O playbook serve para o autor antes de
+  escrever, não para o runtime.
+- Não é retroativo em contratos de framework. Docblocks de override (`boot()`)
+  e PSR-3 ficam onde o framework espera.
+
+---
+
+## §52. No env vars in extensions — use `config.php` and the settings table
+
+Flarum doesn't read `.env`. The operator configures the install through
+`config.php` (debug mode, paths, mail driver, queue driver, trusted proxies)
+and the admin UI / `settings` table (everything else). Extensions follow the
+same contract. **`getenv()`, `$_ENV`, and `$_SERVER['HTTP_*']` reads from an
+extension are an automatic finding.**
+
+### Why the rule is absolute
+
+- Operators don't expect to set env vars for forum extensions; the install
+  docs don't tell them to. A "you must export FOO=bar" requirement is the
+  bug, not the feature.
+- Shared hosting often has no shell access; env vars there require server
+  reconfiguration the operator can't do.
+- Docker entrypoints that build images upstream don't carry per-install
+  secrets; env-var dependencies break on container redeploy.
+- PHP-FPM pools inherit env from the master, which is set at service start —
+  changing an env var requires a restart, not a config reload.
+
+### Where each setting belongs
+
+| Concern | Goes in | How to read |
+|---|---|---|
+| Debug / verbose output | `config.php` `'debug' => true` | `app(Flarum\Foundation\Config::class)['debug']` |
+| Forum URL | `config.php` `'url'` | `$config['url']` or `app('flarum.config')->url()` |
+| DB credentials | `config.php` `'database'` | `$config['database']` |
+| Trusted reverse proxies | `config.php` `'trustedProxies'` | resolved by core middleware |
+| Per-install secret derivation | `config.php` (`url` + `paths.base`) | KDF: `hash('sha256', ...)` |
+| Stripe API keys, mail SMTP, etc. | admin UI → `settings` table | `SettingsRepositoryInterface::get(...)` |
+| Per-actor preferences | `users.preferences` JSON | `$user->preferences['x']` |
+
+### Gating console commands on debug mode
+
+```php
+// extend.php
+$boot = Support\BootSettings::load();
+
+(function () use ($boot) {
+    $console = (new Extend\Console())
+        ->command(Console\SyncLicensesCommand::class);
+
+    if ($boot->debugMode()) {
+        $console = $console
+            ->command(Console\DebugPackagesCommand::class)
+            ->command(Console\DebugShopPathCommand::class);
+    }
+    return $console;
+})()
+```
+
+`Support\BootSettings` (a small per-install snapshot helper) reads the Config
+once at extender-build time, caches `debug`, and exposes `debugMode(): bool`.
+Centralizes the try/catch + cache pattern so the rest of the extension never
+calls `resolve(Config::class)` directly.
+
+### Anti-patterns
+
+- `getenv('MYEXT_DEBUG') === '1'` — reads from PHP-FPM env, not `config.php`.
+- `$_ENV['MYEXT_KEY']` — same as above plus inconsistent across SAPI (cli vs
+  fpm read different files).
+- `putenv()` inside a service provider — pollutes the worker process for
+  every subsequent request.
+- Reading config from `getenv` and the settings table for the *same* setting —
+  one always wins, and the operator can't tell which.
+
+### Migration path when an extension already reads env
+
+If a deprecated env var is in production use, support both for one minor
+version: read settings/Config first, fall back to env with a deprecation
+warning logged. Drop the env path in the next breaking release. Don't add
+new env reads.
+
+### Quick audit
+
+```bash
+rg -n "getenv\\(|\\\$_ENV\\[|\\\$_SERVER\\['HTTP_" src/
+# Every hit must be removed or replaced with Config / SettingsRepository.
+```
+
+---
+
+## §53. Handlers gordos — quebre `handle()` quando passar de ~100 linhas
+
+Um `RequestHandlerInterface::handle()` (ou `AbstractCommand::fire()`) acima de
+~100 linhas é sinal automático de refator. Não importa quantas validações
+encadeadas existem — o controller é o lugar errado para conter regra de
+negócio. Reviewers chamam de "god method" e a pontuação cai sozinha porque
+qualquer correção no fluxo exige reler 500 linhas de lógica encadeada.
+
+### Threshold concreto
+
+- **`handle()` ≤ 100 linhas**: aceitável.
+- **`handle()` 100–200 linhas**: refator desejável; planeje na próxima
+  iteração tocando o arquivo.
+- **`handle()` > 200 linhas**: bloqueante. Refator antes de merge.
+
+A contagem inclui closures internas. `try/catch` envolvendo um bloco grande
+conta como "uma linha" só se o bloco TODO está extraído para outro método.
+
+### Onde extrair
+
+| Tipo de bloco | Para onde extrair |
+|---|---|
+| Cascata de "se X então 422" antes do work | `Service\<Domain>\<Domain>Gate` |
+| Sanitização + required-check de payload | `Service\<Domain>\<Field>Validator` |
+| Resolução de regra com várias dependências | `Service\<Domain>\<X>Resolver` |
+| Criação atômica de N rows com transação | `Service\<Domain>\<X>Builder` ou `<X>Factory` |
+| Decisão de branch (free vs Stripe vs offline) | métodos `finalize*` no próprio controller |
+
+O controller fica como orquestrador: recebe `ServerRequestInterface`, chama
+gate, valida, despacha para o builder, devolve `JsonResponse`. Cada serviço
+extraído fica testável isoladamente.
+
+### Exemplo do split aplicado
+
+O `CreateCheckoutController` original tinha 569 linhas, `handle()` com ~530.
+Após refator: 276 linhas no controller, `handle()` com ~140; três serviços em
+`src/Service/Checkout/`:
+
+```
+src/Service/Checkout/CheckoutGate.php          (135 linhas — gates de acesso)
+src/Service/Checkout/BillingValidator.php      ( 49 linhas — sanitize + required)
+src/Service/Checkout/CheckoutOrderBuilder.php  (186 linhas — Order + items + activations)
+```
+
+O controller orquestra:
+
+```php
+public function handle(ServerRequestInterface $request): ResponseInterface
+{
+    $items = $this->cart->items($request);
+    if ($err = $this->gate->check($request, $items)) {
+        return new JsonResponse($err, $err['http'] ?? 422);
+    }
+
+    $billing = BillingValidator::sanitize($body['billing'] ?? []);
+    if ($missing = BillingValidator::missingField($billing, $items)) {
+        return new JsonResponse(['error' => 'missing_field', 'field' => $missing], 422);
+    }
+
+    $order = $this->builder->build($items, $billing, /* ... */);
+
+    return $this->finalizeStripe($order, /* ... */);
+}
+```
+
+### Anti-padrões
+
+- **Refator que só renomeia métodos protegidos no mesmo controller.** Manter
+  todos os métodos no controller não resolve — fica um controller de 600
+  linhas em vez de 530. O ponto é extrair para classes injetáveis.
+- **Reservation/transação fora do builder.** Se a transação está num método
+  do controller, qualquer exception no caminho vaza a reserva (de cupom, de
+  pool). A transação MORA no builder; o controller chama `releaseReservation`
+  no catch.
+- **Validator estático puxando settings.** Validator é static utility — não
+  injeta dependências. Se precisa de settings, é gate (instanciável), não
+  validator.
+
+### Audit lint
+
+```bash
+rg -nU "public function (handle|fire|process)\\(.*?\\): [A-Za-z]+\\s*\\{" --type=php src/ -A 200 \
+  | rg "^\\s*\\}" -B 200 | awk '/public function (handle|fire|process)/{c=0} {c++; print}'
+```
+
+(Use seu IDE — qualquer ferramenta que conte linhas por método serve.)
+
+---
+
+## §54. Laravel Filesystem vs PHP nativo
+
+Funções nativas de filesystem (`file_get_contents`, `file_put_contents`,
+`mkdir`, `unlink`, `rename`, `scandir`, `is_file`) **devem ser a exceção**.
+A regra default é `Illuminate\Contracts\Filesystem\Factory` injetado, com a
+extensão registrando seu disco via `Extend\Filesystem`.
+
+### Quando a exceção é legítima
+
+| Ferramenta nativa | Quando não há alternativa Flysystem |
+|---|---|
+| `ZipArchive` | Flysystem não tem API de zip — precisa de path real |
+| `php_strip_whitespace` | Aceita só um arquivo path nativo |
+| `pcntl_*`, `posix_*` | Não há disco envolvido — é processo |
+| `RecursiveDirectoryIterator` sobre dir extraído | Iteração estrutural local, pré-pipeline |
+| `tempnam` / `sys_get_temp_dir` | **Não**: use `Flarum\Foundation\Paths::storage` |
+
+### Padrão correto quando você precisa de paths reais
+
+Mesmo nos casos legítimos da tabela acima, a `Paths` do Flarum vem por
+injeção (nunca via `resolve()` inline ou `sys_get_temp_dir`):
+
+```php
+class ZipPostProcessor
+{
+    public function __construct(
+        protected LoggerInterface $logger,
+        protected LicenseSigner $signer,
+        protected Paths $paths,
+    ) {
+    }
+
+    protected function resolveTmpBase(): string
+    {
+        $base = $this->paths->storage . '/marketplace/.tmp';
+        if (! is_dir($base)) {
+            @mkdir($base, 0700, true);
+        }
+        return is_writable($base) ? $base : sys_get_temp_dir();
+    }
+}
+```
+
+`sys_get_temp_dir()` fica APENAS como fallback de último recurso (host com
+storage não-gravável); em produção real, sempre cai no path de
+`paths->storage`. Em shared hosting, `/tmp` é compartilhado com tenants
+vizinhos — TOCTOU sobre arquivos por lá é uma classe inteira de bug.
+
+### Quando NÃO é exceção legítima
+
+- **Servir arquivos para download**: use `$disk->readStream($path)` →
+  `Laminas\Diactoros\Stream` (§38.2 cobre).
+- **Persistir uploads de admin**: use `$disk->putFileAs(...)`. O finding 11
+  (uploads) já dita o pipeline; native `move_uploaded_file` é o que
+  `UploadedFileInterface::moveTo` faz por baixo, mas a API correta é
+  `getStream()` + `$disk->writeStream($stream)`.
+- **Cache de blobs derivados**: registre um disco dedicado (`mp-cache`) via
+  `Extend\Filesystem`; o cleanup vira `$disk->deleteDirectory($prefix)`.
+
+### Audit lint
+
+```bash
+rg -nE '(file_get_contents|file_put_contents|fopen|fwrite|mkdir|unlink|rename|scandir|copy|is_file|is_dir|realpath|tempnam|sys_get_temp_dir)\(' src/
+# Cada hit fora de Service/ZipPostProcessor.php, Service/IntegrityInjector.php
+# e LicenseObfuscator (todos legítimos por ZipArchive) precisa virar Filesystem.
+```
+
+---
+
+## §55. Pinning de versão de SDK externo
+
+Fixar `Stripe::setApiVersion('2025-02-24.acacia')` enquanto o `stripe-php`
+^20 tem default `2026-04-22.dahlia` é uma armadilha técnica reconhecida:
+
+1. **Stripe deprecia versões antigas** com prazo público. Quando seu pin
+   atingir EOL, o webhook quebra silenciosamente — `signature mismatch` ou
+   `unknown event type`.
+2. **Você perde melhorias de segurança/confiabilidade** das versões mais
+   novas (mudanças no shape de `Subscription.items[].current_period_*` da era
+   basil, por exemplo).
+3. **Compat se acumula**: cada nova versão do SDK que você instala precisa
+   ser regredida ao shape antigo.
+
+### Padrão correto
+
+**Não fixe a versão. Em vez disso, escreva uma camada de compat para os
+campos cujo shape mudou.**
+
+```php
+class StripeCheckout
+{
+    public const STRIPE_API_VERSION = '';
+
+    protected function configure(): void
+    {
+        Stripe::setApiKey($this->settings->get('marketplace.stripe_secret_key'));
+        if (self::STRIPE_API_VERSION !== '') {
+            Stripe::setApiVersion(self::STRIPE_API_VERSION);
+        }
+    }
+}
+```
+
+Os pontos que dependem da forma dos campos passam por um helper
+`StripeCompat` que lê ambos os shapes:
+
+```php
+class StripeCompat
+{
+    public static function periodEnd(StripeSubscription|StripeObject|array|null $sub): ?int
+    {
+        $sub = self::asObj($sub);
+        $items = $sub?->items?->data ?? null;
+        if (is_array($items) && isset($items[0]?->current_period_end)) {
+            return (int) $items[0]->current_period_end;
+        }
+        return isset($sub?->current_period_end) ? (int) $sub->current_period_end : null;
+    }
+
+    public static function invoiceSubscriptionId(StripeObject|array|null $invoice): ?string
+    {
+        $invoice = self::asObj($invoice);
+        $nested = $invoice?->parent?->subscription_details?->subscription ?? null;
+        if (is_string($nested) && $nested !== '') return $nested;
+        $top = $invoice?->subscription ?? null;
+        return is_string($top) && $top !== '' ? $top : null;
+    }
+}
+```
+
+Vantagens:
+
+- Webhooks **em flight** no shape antigo continuam tratáveis durante deploy.
+- Bump do SDK não é mais bloqueante — só atualiza o `composer.json`.
+- Migrar para a nova API é uma decisão deliberada com PR isolado; quando
+  todo consumidor da Stripe usa o compat, remover o pin é trivial.
+
+### Generalizar para outros SDKs
+
+| SDK | Campo que muda entre versões | Onde colocar compat |
+|---|---|---|
+| `stripe/stripe-php` | `subscription.current_period_*`, `invoice.subscription` | `Service/StripeCompat.php` |
+| AWS SDK (S3/SES) | retornos `Result` vs `array` | `Service/AwsCompat.php` |
+| `paypalhttp/paypal-checkout-sdk` | shapes de Order v1 vs v2 | `Service/PaypalCompat.php` |
+| `firebase/php-jwt` | `decode()` argumentos posicionais | `Service/JwtCompat.php` |
+
+A regra: **se o SDK tem um padrão público de major-version bump com breaking
+changes na resposta da API, você precisa de uma classe `<SDK>Compat`.**
+
+### Quando pinning é OK
+
+- Versão major do SDK pinned no `composer.json` (`"stripe/stripe-php": "^20"`).
+- Algoritmo criptográfico pinned (`hash('sha256', ...)`) — esses sim devem
+  ser explícitos.
+- DB driver versão minor para reprodutibilidade (`"mysql" => "^8.0"`).
+
+### Quando pinning é débito técnico
+
+- API version de SaaS externo (Stripe, Twilio, Mailgun, etc.) pinned sem
+  compat layer.
+- `composer.lock` com lib desatualizada há > 1 ano sem motivo.
+- Comentário "TODO: migrate when we have time" sem ticket.
 
 ---
 
