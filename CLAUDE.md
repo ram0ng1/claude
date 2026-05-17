@@ -72,6 +72,11 @@ Base Github: https://github.com/ram0ng1/verified, https://github.com/ram0ng1/avo
 - §53 **Handlers gordos** — `handle()` acima de ~100 linhas é refator obrigatório; extraia gates, validators, builders para `src/Service/<Domain>/`
 - §54 **Laravel Filesystem vs I/O nativo** — sempre `Illuminate\Contracts\Filesystem\Factory`; exceções (ZipArchive, php_strip_whitespace) ficam isoladas e usam `Flarum\Foundation\Paths` no construtor, jamais `sys_get_temp_dir`
 - §55 **Pinning de SDK externo** — não fixe versão de API de SDK sem compat layer + plano de migração; deixar o pin estagnado vira technical-debt time-bomb
+- §56 **Webhook handlers — despachar o job, nunca processar inline** — o anti-padrão "`ProcessXJob` totalmente construído mas nunca despachado"; Stripe espera resposta ≤30s; retries silenciosos quando o handler estoura o timeout; `JsonResponse(['received' => true])` ANTES da lógica de negócio
+- §57 **Token domain binding — cabeçalho ausente não é "dev mode"** — `detectDomain()` retornando `''` e listando `''` em `DEV_DOMAIN_HINTS` torna o binding contornável omitindo o header; fallback correto é o `Host` da requisição, e binding presente exige header presente
+- §58 **Timestamps de migração devem ser únicos** — Laravel ordena por filesystem sort quando carimbos colidem (indefinido entre plataformas); antes do release, renomeie; depois do release, escreva uma migração de reparo idempotente
+- §59 **Verificação HMAC deve devolver o modelo resolvido** — não re-consultar `Subscription`/`OrderItem` no controller depois que a camada de assinatura já fez o lookup; um endpoint público chamado a cada page load amplifica cada query duplicada por 100×
+- §60 **End-to-end testing harness** — `tests/E2E/` reusável (PHPUnit + Python + Edge headless): matriz de endpoints com happy/falha, screenshots reproduzíveis, probe de latência do webhook, testes de regressão de findings sem boot do Flarum
 
 ---
 
@@ -6244,6 +6249,835 @@ changes na resposta da API, você precisa de uma classe `<SDK>Compat`.**
   compat layer.
 - `composer.lock` com lib desatualizada há > 1 ano sem motivo.
 - Comentário "TODO: migrate when we have time" sem ticket.
+
+---
+
+## §56. Webhook handlers — despachar o job, nunca processar inline
+
+Provedores externos (Stripe, GitHub, Twilio, Mailgun) impõem **deadlines de
+resposta no handler** — Stripe declara 30 segundos, depois marca a tentativa
+como falhada e reenfileira o evento. Se o controlador:
+
+1. Persiste o evento no banco (`webhook_events` com `event_id` único),
+2. Verifica a assinatura HMAC,
+3. **E chama o processador inline** (`$this->processor->process($event)`),
+
+a primeira execução longa (e-mail SMTP, claim de digital asset, sync para
+Stripe API) estoura o budget. Stripe reenvia. A segunda execução talvez
+acerte a dedup, mas **efeitos colaterais executados antes da falha não são
+revertidos automaticamente** — cupom já consumido, asset já marcado como
+claimed, e-mail já enviado.
+
+### Anti-padrão recorrente: "job fully built, never dispatched"
+
+A revisão de Maio/2026 (branch `BC`) encontrou:
+
+- `ProcessStripeEventJob` definido com `$tries=3`, `$timeout=120`,
+  `handle()` completo, retry logic, dedup por `event_id`;
+- `StripeWebhookController::handle()` chamando `$this->processor->process($event)`
+  **inline** — o `::dispatch()` da classe Job não existe em parte alguma
+  do código base.
+
+Esse é um sintoma de "passada final de fiação ficou incompleta" — alguém
+construiu a abstração assíncrona mas esqueceu de comutá-la. Pesquise sempre:
+
+```bash
+# Qualquer Job\... que NÃO aparece em ::dispatch(...) é morto ou inacabado.
+rg -nE 'class\s+(\w+Job)\s+implements\s+ShouldQueue' src/Job/ | awk -F: '{print $NF}' | while read j; do
+  name=$(echo "$j" | grep -oE '\w+Job')
+  count=$(rg -c "${name}::dispatch" src/ || echo 0)
+  echo "$name dispatched: $count"
+done
+```
+
+### A armadilha do `Dispatchable` (incidente real Maio/2026)
+
+A documentação do Laravel ensina:
+
+```php
+use Illuminate\Foundation\Bus\Dispatchable;
+
+class MyJob implements ShouldQueue
+{
+    use Dispatchable, InteractsWithQueue, SerializesModels;
+}
+
+MyJob::dispatch($id);
+MyJob::dispatchSync($id);
+MyJob::dispatchAfterResponse($id);
+```
+
+**Esse trait não existe em Flarum 2.** O pacote `illuminate/foundation`
+nunca é instalado — Flarum tem sua própria foundation
+(`flarum/core/src/Foundation`). O autoloader só descobre o trait ausente
+*quando alguém invoca um método estático que dispara o carregamento da
+classe do Job*. Resultado típico:
+
+1. Job class é escrita com `use Illuminate\Foundation\Bus\Dispatchable;`.
+2. CI / testes unitários estáticos passam (`assertStringContainsString('use Dispatchable', $jobFile)`).
+3. Nada chama `MyJob::dispatch()` por meses.
+4. Alguém finalmente conecta: `MyJob::dispatch($id);`.
+5. Webhook responde **HTTP 500** com `code:unknown`.
+6. Stripe interpreta 500 como retry-worthy. Toda nova ordem fica `pending`
+   porque o webhook sempre 500a.
+7. Stack trace só visível em logs do servidor (ou response body em modo
+   debug): `Error: Trait "Illuminate\Foundation\Bus\Dispatchable" not found`.
+
+### Forma correta — injetar `Bus\Dispatcher`, usar `Queueable`
+
+Padrão idêntico ao `flarum/core/src/Api/Controller/CreateTokenController.php`:
+
+```php
+use Illuminate\Bus\Queueable;
+use Illuminate\Contracts\Queue\ShouldQueue;
+use Illuminate\Queue\InteractsWithQueue;
+use Illuminate\Queue\SerializesModels;
+
+class ProcessStripeEventJob implements ShouldQueue
+{
+    use Queueable, InteractsWithQueue, SerializesModels;
+
+    public int $tries = 3;
+    public int $timeout = 120;
+
+    public function __construct(public int $eventRowId) {}
+
+    public function handle(EventProcessor $processor, LoggerInterface $logger): void { /* ... */ }
+}
+```
+
+```php
+use Illuminate\Contracts\Bus\Dispatcher as BusDispatcher;
+
+class StripeWebhookController
+{
+    public function __construct(
+        protected StripeCheckout $stripe,
+        protected LoggerInterface $logger,
+        protected BusDispatcher $bus,
+    ) {}
+
+    public function handle(ServerRequestInterface $request): ResponseInterface
+    {
+        try {
+            $event = $this->stripe->constructEvent($payload, $sigHeader);
+        } catch (SignatureVerificationException $e) {
+            return new JsonResponse(['error' => 'invalid_signature'], 400);
+        }
+
+        $row = $this->persistEvent($event, $payload);
+        if ($row && $row->processing_status === 'done') {
+            return new JsonResponse(['received' => true, 'deduped' => true]);
+        }
+
+        if ($row) {
+            try {
+                $this->bus->dispatchSync(new ProcessStripeEventJob($row->id));
+            } catch (\Throwable $e) {
+                $this->logger->error('[marketplace] webhook job throw: '.$e->getMessage(), [
+                    'event_id' => $event->id,
+                    'trace'    => $e->getTraceAsString(),
+                ]);
+                return new JsonResponse(['received' => true, 'processed' => false], 200);
+            }
+            return new JsonResponse(['received' => true]);
+        }
+
+        return $this->processWithoutAuditRow($event);
+    }
+}
+```
+
+Pontos críticos:
+
+- **`Queueable`** (de `illuminate/bus`) substitui `Dispatchable` (que não
+  existe). É o mínimo necessário para satisfazer `ShouldQueue` e os hooks
+  de retry/middleware. Pacote `illuminate/bus` é shipped por Flarum.
+- **`Bus\Dispatcher` injetado** no construtor. Flarum registra a binding em
+  `Flarum\Bus\BusServiceProvider`.
+- **`$this->bus->dispatchSync(new $job)`** sempre roda inline — não depende
+  de driver de queue nem de worker do operador.
+- **`try/catch` em volta do dispatch** absorve falhas e responde 200. Se
+  voltasse 500, a Stripe retentaria infinitamente e amplificaria o problema.
+
+### Tabela de comportamento das APIs de dispatch em Flarum 2
+
+| Forma | Funciona em Flarum 2? | Observação |
+|---|---|---|
+| `MyJob::dispatch($id)` via trait `Dispatchable` | **Fatal** — trait não existe | `Trait "Illuminate\Foundation\Bus\Dispatchable" not found` |
+| `MyJob::dispatchSync($id)` via trait | **Fatal** — mesmo motivo | idem |
+| `MyJob::dispatchAfterResponse($id)` via trait | **Fatal** — mesmo motivo | idem |
+| `$this->bus->dispatch(new MyJob($id))` (injetado) | Funciona, mas enfileira | Precisa de queue worker do operador rodando |
+| `$this->bus->dispatchAfterResponse(new MyJob($id))` (injetado) | **Cai silenciosa** | `Container::terminating()` em Flarum é no-op (`@deprecated`) |
+| `$this->bus->dispatchSync(new MyJob($id))` (injetado) | **Sempre roda** | Latência adicionada à resposta; padrão correto para webhooks |
+| `$this->processor->process($event)` inline (sem job) | Funciona | Perde audit row, retry, e a estrutura |
+
+### Caveat de latência
+
+`dispatchSync` adiciona ao tempo de resposta. Para o webhook da Stripe:
+
+- Budget: 30 segundos.
+- Processamento atual (e-mail SMTP + asset claim + refund eventual): ~1–3s.
+- Margem confortável; se algum dia ultrapassar, o operador configura queue
+  worker e troca para `$this->bus->dispatch(new $job)`.
+
+A vantagem do shape com Job + Bus injetado é justamente essa: a troca é
+uma única linha no controller; não precisa refatorar a lógica.
+
+### Lint estático que pega esse bug ANTES do deploy
+
+```bash
+rg -nE 'use\s+Illuminate\\\\Foundation' src/ vendor/ramon/*/src/ 2>/dev/null \
+  | grep -v 'vendor/illuminate/' \
+  | grep -v 'vendor/laravel/'
+```
+
+Qualquer match em `src/` de uma extensão Flarum é **bug fatal aguardando
+para ser disparado**. Pacote `illuminate/foundation` é exclusivo do Laravel
+Framework e nunca aparece como dependência do `flarum/core`.
+
+Outra checagem barata: carregar a classe e tentar `reflect`-ar antes de
+deployar.
+
+```php
+class_exists(\Ramon\Marketplace\Job\ProcessStripeEventJob::class, true);
+```
+
+Se o trait estiver faltando, isso lança no momento do load — visível em
+qualquer health check.
+
+### Caveat de latência
+
+`dispatchSync` adiciona ao tempo de resposta. Para o webhook da Stripe:
+
+- Budget: 30 segundos.
+- Processamento atual (e-mail SMTP + asset claim + refund refund eventual): ~1–3s.
+- Margem confortável; se algum dia ultrapassar, o operador configura queue worker e troca para `::dispatch`.
+
+A vantagem do shape com Job é justamente essa: a troca é uma única linha
+no controller; não precisa refatorar a lógica.
+
+### Casos relacionados (não-Stripe)
+
+| Origem | Deadline conhecido | Quê dispatch'ar |
+|---|---|---|
+| GitHub webhook | 10s (com retry) | `ProcessGithubEventJob` |
+| Mailgun events | sem deadline rígido, mas 5xx → backoff | `ProcessMailgunEventJob` |
+| Twilio status callback | 15s | `ProcessTwilioStatusJob` |
+| PayPal IPN/Webhook | 20s | `ProcessPaypalEventJob` |
+
+### Checklist
+
+- [ ] Toda classe `*Job` em `src/Job/` tem ao menos um `::dispatch(` em outro arquivo.
+- [ ] `*WebhookController::handle()` retorna `200` em < 500ms no path feliz.
+- [ ] A business logic está no Job, não no controlador.
+- [ ] Persistência do evento (com unique index em `event_id`) acontece ANTES
+      do dispatch — replays do provedor não disparam jobs duplicados.
+
+---
+
+## §57. Token domain binding — cabeçalho ausente não é "dev mode"
+
+Quando um token (composer auth, marketplace API key, license key) declara
+um `bound_domain` para vinculá-lo a um servidor específico, a regra é
+explícita: **token ligado a domínio só funciona desse domínio**. A
+implementação parece simples — comparar o header recebido com o campo
+persistido — mas tem armadilhas semânticas.
+
+### Anti-padrão: tratar `''` como dev hint
+
+```php
+class ComposerAuth
+{
+    private const DEV_DOMAIN_HINTS = ['localhost', '127.0.0.1', '.test', '.local', ''];
+
+    private function detectDomain(ServerRequestInterface $request): string
+    {
+        return $request->getHeaderLine('X-MP-Domain');              // string vazia se ausente
+    }
+
+    private function isDevDomain(string $domain): bool
+    {
+        foreach (self::DEV_DOMAIN_HINTS as $hint) {
+            if ($domain === $hint || str_contains($domain, $hint)) return true;   // ← '' bate em qualquer string
+        }
+        return false;
+    }
+
+    public function checkAndBindDomain(Token $token, ServerRequestInterface $request): bool
+    {
+        $domain = $this->detectDomain($request);
+        if ($this->isDevDomain($domain)) return true;               // ← bypass total
+        if ($token->bound_domain === null) {
+            $token->bound_domain = $domain;
+            $token->save();
+            return true;
+        }
+        return $token->bound_domain === $domain;
+    }
+}
+```
+
+Qualquer cliente que **omita `X-MP-Domain`** (o `composer` padrão sem
+configuração custom, qualquer `curl` ad-hoc, qualquer proxy que strip
+custom headers) ignora a verificação. O binding fornece **falsa
+sensação de segurança**.
+
+### Forma correta
+
+Duas correções, na ordem de preferência:
+
+**1. Header de domínio é obrigatório quando o token tem binding.**
+
+```php
+public function checkAndBindDomain(Token $token, ServerRequestInterface $request): bool
+{
+    $declared = trim($request->getHeaderLine('X-MP-Domain'));
+
+    // Binding já existe — header tem que estar presente E bater.
+    if ($token->bound_domain !== null) {
+        if ($declared === '') return false;                         // ← rejeita ausência
+        return strcasecmp($token->bound_domain, $declared) === 0;
+    }
+
+    // Primeiro uso — só faz bind se o domínio for derivável.
+    $bind = $declared !== '' ? $declared : $this->fallbackFromHost($request);
+    if ($bind === null) return false;
+    $token->bound_domain = $bind;
+    $token->save();
+    return true;
+}
+```
+
+**2. Fallback determinístico: use o `Host` header da requisição.**
+
+```php
+private function fallbackFromHost(ServerRequestInterface $request): ?string
+{
+    $host = parse_url((string) $request->getUri(), PHP_URL_HOST) ?: $request->getHeaderLine('Host');
+    $host = preg_replace('/:\d+$/', '', (string) $host);
+    return $host !== '' ? strtolower($host) : null;
+}
+```
+
+O `Host` chega em **toda** requisição HTTP/1.1 — não tem como omitir sem
+quebrar o protocolo. Usar `Host` torna o binding **sempre** verificável,
+inclusive em clientes "burros" como `composer` sem custom headers.
+
+**3. Limpe a lista de "dev hints".**
+
+`''` nunca deve ser dev hint — string vazia é "header ausente", não
+"localhost". E mesmo `localhost`/`127.0.0.1` precisam matchear *exato*,
+não `str_contains` (caso contrário `127.0.0.1.evil.com` passa).
+
+```php
+private function isDevDomain(string $domain): bool
+{
+    $domain = strtolower(trim($domain));
+    if ($domain === '') return false;                               // ← chave da correção
+    return in_array($domain, ['localhost', '127.0.0.1', '::1'], true)
+        || str_ends_with($domain, '.test')
+        || str_ends_with($domain, '.local');
+}
+```
+
+### Modelo de ameaça que o binding precisa cobrir
+
+| Cenário | Sem o binding correto | Com o binding correto |
+|---|---|---|
+| Atacante exfiltra `auth.json` de um cliente | Usa o token de qualquer IP | Token só vale do `Host` original |
+| Cliente debugando com curl sem custom header | `''` → dev hint → bypass | Falha; obriga-o a passar `--header "Host: ..."` (que `curl` envia por default) |
+| Cliente migrando para novo servidor | Bind silenciosamente troca para o novo host | Bind continua amarrado; obriga issuance de novo token (auditável) |
+
+### Checklist
+
+- [ ] `DEV_DOMAIN_HINTS` não contém `''`.
+- [ ] `str_contains` em comparação de domínio foi substituído por `===`,
+      `str_ends_with`, ou matching de FQDN exato.
+- [ ] Quando o header de domínio está ausente, há fallback para `Host`
+      ou rejeição explícita — nunca "permitir".
+- [ ] Logs de auth incluem `(bound_domain, declared_domain, host)` para
+      forense.
+
+---
+
+## §58. Timestamps de migração devem ser únicos
+
+Laravel ordena migrações **alfabeticamente pelo nome do arquivo**. Quando
+dois arquivos compartilham o mesmo prefixo de timestamp
+(`2026_04_24_000007_add_screenshots.php` e
+`2026_04_24_000007_create_versions.php`), o desempate vira **filesystem
+sort** — comportamento indefinido entre Linux (ext4/btrfs), macOS (APFS) e
+Windows (NTFS).
+
+### Sintomas em produção
+
+- Em dev (NTFS), `nullable_digital_file` roda antes de `create_digital_versions`
+  e altera uma coluna que ainda não existe → fatal.
+- Em CI (ext4), a ordem inverte e tudo passa.
+- Cliente em produção (CentOS, ext4) também passa.
+- Cliente em produção (Ubuntu, btrfs) falha.
+- Bug irreprodutível para o autor; relatórios contraditórios.
+
+### Locate
+
+```bash
+# Lista timestamps duplicados nos arquivos de migração da extensão.
+ls migrations/ | awk -F_ '{print $1"_"$2"_"$3"_"$4}' | sort | uniq -d
+```
+
+Qualquer linha de saída é um finding.
+
+### Correção pré-release
+
+Se a extensão **ainda não foi instalada por nenhum cliente**, renomeie os
+arquivos para timestamps únicos (com incremento sequencial):
+
+```text
+2026_04_24_000007_add_product_screenshots.php   → 2026_04_24_000007_*
+2026_04_24_000007_create_digital_versions.php   → 2026_04_24_000008_*
+2026_04_24_000008_nullable_digital_file.php     → 2026_04_24_000009_*
+2026_04_24_000008_other.php                     → 2026_04_24_000010_*
+```
+
+E **garanta** que a renomeação respeita a dependência de schema — a
+migração que **cria** a tabela/coluna sempre roda antes da que a
+**modifica**.
+
+### Correção pós-release
+
+Se a extensão já foi instalada, **não renomeie os arquivos antigos** —
+Laravel armazena o `migration` filename na tabela `migrations`, e
+renomear faz com que o instalador re-rode a migração e quebre. Em vez
+disso:
+
+1. Deixe os arquivos com timestamp duplicado como estão (instalações
+   existentes já passaram da fase crítica).
+2. Adicione uma **migração de reparo idempotente** com timestamp
+   posterior, que aplica o estado final desejado caso o sistema-de-arquivos
+   de algum cliente novo tenha rodado na ordem errada:
+
+```php
+<?php
+use Flarum\Database\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Database\Schema\Builder;
+
+return [
+    'up' => function (Builder $schema) {
+        if (! $schema->hasTable('digital_versions')) {
+            // Reproduz o create completo aqui, com hasTable guard.
+            return;
+        }
+        if ($schema->hasTable('digital_versions') && ! $schema->hasColumn('digital_versions', 'digital_file_id')) {
+            $schema->table('digital_versions', function (Blueprint $t) {
+                $t->unsignedInteger('digital_file_id')->nullable();
+            });
+        }
+    },
+    'down' => fn () => null,
+];
+```
+
+O guard `hasTable`/`hasColumn` torna a migração **safe-to-rerun** e
+neutraliza o estado divergente.
+
+### Política preventiva
+
+- Use **timestamp com segundos** (`2026_04_24_143205`) em vez de
+  `_000007`. Colisão fica praticamente impossível.
+- Inclua um teste de CI que falhe quando dois arquivos compartilharem
+  prefixo:
+
+```bash
+test "$(ls migrations/ | awk -F_ '{print $1\"_\"$2\"_\"$3\"_\"$4}' | sort | uniq -d | wc -l)" = "0"
+```
+
+### Cross-reference
+
+[[feedback_flarum_migrations]] — closure migrations já têm `hasTable`/
+`hasColumn` guards; estender essa disciplina para timestamps únicos é a
+mesma família de robustez.
+
+---
+
+## §59. Verificação HMAC deve devolver o modelo resolvido
+
+Quando uma camada de assinatura precisa do segredo da chave da licença
+para validar o HMAC, ela faz um lookup no banco
+(`Subscription::where('license_key', $key)->first()`). **Esse modelo já
+está em memória** quando a verificação retorna. Se o controlador
+imediatamente consulta o mesmo modelo de novo, é uma **query duplicada
+em cada request**.
+
+### Anti-padrão (revisão Maio/2026)
+
+```php
+// src/Service/License/InboundSignature.php
+class InboundSignature
+{
+    public function verify(ServerRequestInterface $request): array
+    {
+        $key = $request->getHeaderLine('X-License-Key');
+        $secret = $this->resolveSharedSecret($key);                 // ← query 1+2
+        // ...HMAC compare...
+        return ['valid' => true, 'license_key' => $key];            // ← descarta o modelo
+    }
+
+    private function resolveSharedSecret(string $key): ?string
+    {
+        if ($sub = Subscription::where('license_key', $key)->first()) {     // query 1
+            return $sub->shared_secret;
+        }
+        if ($item = OrderItem::where('license_key', $key)->first()) {       // query 2
+            return $item->shared_secret;
+        }
+        return null;
+    }
+}
+
+// src/Api/Controller/CheckLicenseController.php
+class CheckLicenseController
+{
+    public function handle(ServerRequestInterface $request): ResponseInterface
+    {
+        $result = $this->signature->verify($request);
+
+        // ← MESMA query, segunda vez:
+        $subscription = Subscription::with(['user', 'product'])
+            ->where('license_key', $result['license_key'])->first();         // query 3
+        $orderItem    = OrderItem::with(['order', 'product'])
+            ->where('license_key', $result['license_key'])->first();         // query 4
+        // ...
+    }
+}
+```
+
+Com 100 extensões instaladas chamando `/license/check` a cada page load,
+isso vira **400 queries/min por sessão**. O endpoint público é caminho
+quente — não dá para tolerar redundância.
+
+### Forma correta
+
+A camada de assinatura **devolve o modelo já resolvido**. O controlador
+faz só o eager-loading adicional necessário (relations).
+
+```php
+class InboundSignature
+{
+    /**
+     * @return array{valid: bool, license_key: string, model: Subscription|OrderItem|null}
+     */
+    public function verify(ServerRequestInterface $request): array
+    {
+        $key = $request->getHeaderLine('X-License-Key');
+        $model = Subscription::where('license_key', $key)->first()
+              ?? OrderItem::where('license_key', $key)->first();
+
+        if ($model === null) return ['valid' => false, 'license_key' => $key, 'model' => null];
+
+        $expected = hash_hmac('sha256', $this->canonicalize($request), $model->shared_secret);
+        $given    = $request->getHeaderLine('X-License-Signature');
+        if (! hash_equals($expected, $given)) {
+            return ['valid' => false, 'license_key' => $key, 'model' => null];
+        }
+
+        return ['valid' => true, 'license_key' => $key, 'model' => $model];
+    }
+}
+
+class CheckLicenseController
+{
+    public function handle(ServerRequestInterface $request): ResponseInterface
+    {
+        $result = $this->signature->verify($request);
+        if (! $result['valid']) return new JsonResponse(['error' => 'invalid_signature'], 401);
+
+        $model = $result['model'];
+        // Eager-load só o que falta — não re-query.
+        $model->loadMissing($model instanceof Subscription ? ['user', 'product'] : ['order', 'product']);
+
+        return new JsonResponse($this->present($model));
+    }
+}
+```
+
+Queries vão de **4 para 2** (ou 1, se você unificar `Subscription` e
+`OrderItem` por um trait + polymorphic relation).
+
+### Alternativa: merge da verificação no controller
+
+Se o `InboundSignature` é só usado por um controlador, mover a
+verificação inteira para dentro dele simplifica:
+
+```php
+public function handle(...): ResponseInterface
+{
+    $key = $request->getHeaderLine('X-License-Key');
+    $model = Subscription::with(['user', 'product'])->where('license_key', $key)->first()
+          ?? OrderItem::with(['order', 'product'])->where('license_key', $key)->first();
+
+    if ($model === null || ! $this->verifyHmac($request, $model->shared_secret)) {
+        return new JsonResponse(['error' => 'invalid_signature'], 401);
+    }
+    return new JsonResponse($this->present($model));
+}
+```
+
+Mas, em geral, mantenha a verificação isolada na service class — o
+controller fica testável e o HMAC fica reusável. Apenas garanta que o
+modelo viaja junto com o resultado.
+
+### Audit
+
+```bash
+# Para cada classe de signature, conferir se ela retorna o modelo:
+rg -nE 'class\s+\w+Signature' src/Service/ | while read f; do
+  rg -n 'function verify' "$f" -A 30 | grep -E 'return.*model|return.*subscription|return.*item'
+done
+```
+
+Se a função `verify` só retorna um bool ou um array sem o modelo, o
+chamador vai re-consultar — é finding.
+
+### Checklist
+
+- [ ] Toda função `verify*` que consulta um modelo no banco devolve esse
+      modelo no array de retorno.
+- [ ] Controladores que chamam `verify*` não fazem `Model::where(mesma_chave)`
+      depois — em vez disso, `$result['model']->loadMissing(...)`.
+- [ ] Endpoints públicos chamados em hot path (license check, heartbeat,
+      ping) têm um teste de contagem de queries (`DB::getQueryLog()`)
+      que falha se ultrapassar o budget.
+
+---
+
+## §60. End-to-end testing harness — auditar uma extensão Flarum contra staging
+
+Toda extensão de produção precisa de uma camada de teste **fora do PHPUnit**
+que exerce a stack inteira contra um forum real: autenticação Flarum, API
+de domínio, integrações (Stripe / SES / Twilio), navegador headless com
+SPA renderizada. Sem isso, o PHPUnit prova só que os pedaços compõem; não
+prova que o deploy não quebra ao primeiro request real.
+
+Esta seção descreve o harness reusável que vive em `tests/E2E/`, gente
+agnóstica à extensão. Os componentes podem ser copiados para qualquer
+extensão Flarum; só o conteúdo dos arrays muda.
+
+### 60.1 Estrutura do diretório
+
+```
+tests/E2E/
+├── .gitignore            # screenshots/, fixtures/, logs/, results.jsonl
+├── run_e2e.py            # orquestrador — chama PHPUnit + Python suites
+├── api_tests.py          # exercita cada rota HTTP com happy + failure path
+├── browser_tests.py      # captura screenshots via Edge headless
+├── fixtures/             # users.json, products.json criados pelo harness
+├── screenshots/<area>/   # PNGs (1440×2400 desktop, 390×844 mobile)
+├── api/results.jsonl     # uma linha por endpoint testado, com latency_ms
+└── logs/                 # forum.json, browser.log.json
+```
+
+`.gitignore` impede que screenshots, fixtures e tokens vazem para o repo.
+A pasta `fixtures/` jamais é commitada — toda credencial fica em variável
+de ambiente lida pelo runner.
+
+### 60.2 Token Flarum no harness
+
+Flarum 2.x espera `Authorization: Token <chave>` (não `Bearer`). O token
+admin é lido de `MP_API_TOKEN` — nunca é hardcoded em arquivo versionado.
+O `run_e2e.py` exporta a env var antes de despachar os scripts; setá-la
+no shell antes funciona igualmente.
+
+```python
+def authed(extra=None):
+    headers = {"Authorization": f"Token {os.environ['MP_API_TOKEN']}",
+               "Accept": "application/json"}
+    if extra: headers.update(extra)
+    return headers
+```
+
+Validação inicial sem custo: bater em `GET /api/users?page[limit]=1` e
+afirmar que o corpo é JSON com `data`. Se voltar HTML, o header está
+errado (alguém testou `Bearer`); se voltar 401, o token caducou.
+
+### 60.3 Matriz de endpoints — happy + failure
+
+Cada rota do `extend.php` vira UMA tupla `(area, name, method, path,
+expected_http_set)`. Iteração é rasa: roda cada uma, registra latency,
+salva o JSONL.
+
+```python
+pairs = [
+    ("public", "products list",      "GET", "/api/myext/products",   (200,)),
+    ("public", "products show 404",  "GET", "/api/myext/products/0", (404,)),
+    ("admin",  "stats happy",        "GET", "/api/myext/admin/stats",(200,)),
+    ("admin",  "stats as guest",     "GET", "/api/myext/admin/stats",(401,403,404)),
+]
+for name, method, path, exp in pairs:
+    run_with_latency(suite, area, name, method, path, exp,
+                     headers=authed() if area != "guest" else None)
+```
+
+A função `run_with_latency` mede `time.perf_counter()`, captura código
+HTTP e excerto do corpo, e empurra um `Result` para a suite. **Cada
+endpoint é exercitado com pelo menos um happy-path e uma failure-path**:
+falta de auth, payload inválido, ID inexistente.
+
+### 60.4 Stripe test-mode (quando aplicável)
+
+Stripe expõe `pm_card_visa` (PaymentMethod sintético de teste) e a chave
+secreta vem do `settings` do Flarum via admin API:
+
+```python
+secret = call_admin("/api/settings", token).get("data", {}) \
+            .get("attributes", {}).get("ext.stripe_secret_key", "")
+if not secret.startswith("sk_test_"):
+    print("[skip] sem chave Stripe acessível, pulando real-payment flow")
+    return
+```
+
+Quando há chave: criar PaymentIntent via REST, confirmar com
+`payment_method=pm_card_visa`, esperar 3–10 s pelo webhook entregar o
+evento, e afirmar via API que `order.payment_status == 'paid'`. Quando
+não há: fabricar um evento webhook assinado com o `webhook_secret` e
+POSTá-lo direto em `/api/myext/stripe/webhook`. Os efeitos colaterais
+(asset claim, e-mail) devem aparecer no banco.
+
+Documente explicitamente no relatório quando o Stripe real foi pulado —
+não finja sucesso.
+
+### 60.5 Screenshots reproduzíveis via Edge headless
+
+Edge headless é menos pesado que Selenium para captura simples:
+
+```python
+EDGE = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
+
+cmd = [EDGE, "--headless=new", "--disable-gpu", "--no-sandbox",
+       "--enable-javascript", "--hide-scrollbars",
+       f"--user-data-dir={tmp}",          # isolado por screenshot
+       f"--window-size={vp}",              # 1440x2400 desktop, 390x844 mobile
+       "--virtual-time-budget=5000",       # espera 5 s a SPA renderizar
+       f"--screenshot={out}", url]
+subprocess.run(cmd, timeout=45)
+```
+
+Pontos críticos:
+
+1. **`--user-data-dir` único** por chamada — sem isso, Edge serializa
+   tudo em uma instância e perde cookies entre páginas.
+2. **`--virtual-time-budget=5000`** dá à SPA tempo para hidratar antes
+   da captura — sem isso, o PNG sai com o skeleton vazio.
+3. **`--enable-javascript` é redundante** (default), mas vale a sinalização
+   explícita para quem ler o script depois.
+4. **Não use `--headless` (legacy)** — `--headless=new` é o engine atual
+   e renderiza CSS modernas (`color-mix`, `:has`).
+5. **Verifique tamanho do PNG** — se < 1 KB, falhou. PNGs reais ficam
+   entre 40 KB e 600 KB.
+
+Pages típicas: home, listagem, detalhe de cada tipo de produto, carrinho
+(vazio + populado), checkout, recibos, error states (404 produto, 403
+admin-as-guest), e o painel admin de cada aba.
+
+### 60.6 Webhook async — afirmar resposta < 1s
+
+A regressão de §56 (webhook handler despachar o job em vez de processar
+inline) só é provada por benchmark de latência:
+
+```python
+started = time.perf_counter()
+status = call_webhook(unsigned=True)
+elapsed_ms = int((time.perf_counter() - started) * 1000)
+assert elapsed_ms < 1000, f"webhook respondeu em {elapsed_ms} ms — processing inline"
+```
+
+400 (invalid_signature) é a resposta esperada quando se POSTa sem
+assinatura — o teste mede o caminho do controller, não o do job. Se o
+controller estava processando inline antes do fix, a latência cresceria
+junto com o tamanho do payload de evento.
+
+### 60.7 Testes de regressão para findings de review
+
+Cada finding fechado em um review merece um teste de regressão **no
+nível certo de abstração** — não tente reproduzir o bug no banco quando
+um assert estrutural já evita a reintrodução.
+
+Padrões observados (que funcionam sem boot do Flarum):
+
+| Tipo de fix | Asserção |
+|---|---|
+| Comportamento de método isolado | `ReflectionMethod` + `invoke` em request fake |
+| Constante alterada | `assertNotContains('', Class::CONST)` |
+| Controller despacha job | `assertStringContainsString('Job::dispatch', file_get_contents(...))` |
+| Schema do payload | parse PHP e conferir chaves do array literal |
+| Timestamps de migração únicos | `glob()` + `array_unique()` em prefixos |
+| Sem `ConnectionInterface` em construtor | `assertStringNotContainsString('ConnectionInterface', source)` |
+
+Arquivo único `Review<YYYY_MM_DD>_RegressionTest.php` por review session.
+Inclua um docblock no topo enumerando os finds; o test name segue
+`test_f<N>_<short_name>` para grep direto. Esse padrão sobrevive ao
+refactor que viria depois — os testes falham só se o fix for revertido.
+
+### 60.8 PHPUnit sem boot do Flarum
+
+A maioria dos asserts de regressão NÃO precisa de boot do Flarum (sem
+DB, sem container, sem migrations). O `phpunit.xml` mínimo:
+
+```xml
+<testsuites>
+    <testsuite name="Unit"><directory>tests/Unit</directory></testsuite>
+    <testsuite name="Integration"><directory>tests/integration</directory></testsuite>
+</testsuites>
+```
+
+`bootstrap="vendor/autoload.php"` é suficiente — só PSR-4 autoload do
+extension, sem inicializar a aplicação. Mockery substitui dependências
+que precisariam de container.
+
+**Cuidado**: classes que `use` traits do Laravel (`Dispatchable`,
+`SerializesModels`) explodem ao serem `new`adas fora do boot Flarum. Para
+elas, use `file_get_contents` + `assertStringContainsString` em vez de
+`new ProcessXJob()`. Não tente bootar Flarum só para testar uma string.
+
+### 60.9 Orquestração
+
+`run_e2e.py` exporta envs, chama PHPUnit, depois os scripts Python em
+sequência (api → browser → webhook probe). Cada etapa retorna seu
+exit code; o orquestrador retorna 0 só se todos forem 0. Exemplo de uso:
+
+```powershell
+$env:MP_API_TOKEN = "..."
+$env:MP_BASE_URL  = "https://staging.example.com"
+python tests/E2E/run_e2e.py
+```
+
+A saída final do orquestrador é a fonte de verdade para o relatório:
+
+```
+========== Summary ==========
+PASS: phpunit + api + browser + webhook latency
+```
+
+### 60.10 Quando o harness vale a pena
+
+Critério prático: se a extensão tem ≥ 5 endpoints HTTP **OU** integra com
+um provedor externo (Stripe, PayPal, GitHub, mail SaaS) **OU** o time
+faz > 1 release por mês, o harness paga aluguel. Para extensões de 1–2
+rotas estáticas, PHPUnit + grep manual já bastam.
+
+### 60.11 Checklist E2E
+
+- [ ] `tests/E2E/.gitignore` exclui screenshots, fixtures, logs, tokens.
+- [ ] `MP_API_TOKEN` lido de env var, jamais hardcoded em arquivo versionado.
+- [ ] Cada rota do `extend.php` aparece pelo menos uma vez em `api_tests.py`.
+- [ ] Cada rota mutante tem uma assertion `as_guest -> 401/403`.
+- [ ] Browser tests cobrem cada page route + os error states (404, 403).
+- [ ] Webhook latency probe afirma resposta < 1 s (regressão de §56).
+- [ ] Stripe real-mode ou explicitamente documentado como pulado.
+- [ ] `Review<DATE>_RegressionTest.php` para cada review session, com um
+      teste por finding.
+- [ ] `run_e2e.py` retorna 0 só quando todas as etapas passam.
 
 ---
 
