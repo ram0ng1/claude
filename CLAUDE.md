@@ -77,6 +77,7 @@ Base Github: https://github.com/ram0ng1/verified, https://github.com/ram0ng1/avo
 - §58 **Timestamps de migração devem ser únicos** — Laravel ordena por filesystem sort quando carimbos colidem (indefinido entre plataformas); antes do release, renomeie; depois do release, escreva uma migração de reparo idempotente
 - §59 **Verificação HMAC deve devolver o modelo resolvido** — não re-consultar `Subscription`/`OrderItem` no controller depois que a camada de assinatura já fez o lookup; um endpoint público chamado a cada page load amplifica cada query duplicada por 100×
 - §60 **End-to-end testing harness** — `tests/E2E/` reusável (PHPUnit + Python + Edge headless): matriz de endpoints com happy/falha, screenshots reproduzíveis, probe de latência do webhook, testes de regressão de findings sem boot do Flarum
+- §61 **Auditoria Floxum-style em PT-BR** — contrato de saída alternativo ao §48: relatório em português brasileiro replicando o estilo Floxum, com 18 convenções rastreáveis, rubrica de Pontuação de Qualidade + Codificado pela vibração, duas frases-veredito canônicas
 
 ---
 
@@ -7078,6 +7079,420 @@ rotas estáticas, PHPUnit + grep manual já bastam.
 - [ ] `Review<DATE>_RegressionTest.php` para cada review session, com um
       teste por finding.
 - [ ] `run_e2e.py` retorna 0 só quando todas as etapas passam.
+
+---
+
+## §61. Auditoria Floxum-style em PT-BR
+
+**Contrato de saída alternativo ao §48.** Quando o usuário pedir uma auditoria
+no estilo Floxum, em português brasileiro — gatilhos típicos: "audita estilo
+Floxum", "revisão Floxum", "/floxum", "gera o relatório Floxum", "audita esta
+extensão (PT-BR)" — produza o relatório seguindo este contrato e **não** o §48.
+Se o gatilho for ambíguo (ex.: "/review" sem qualificador), aplique o §48 em
+inglês; só caia neste §61 quando a intenção PT-BR for explícita ou o usuário
+salvar a preferência em feedback memory.
+
+A persona aplicada para este modo é: **auditor sênior de extensões Flarum 2.x**
+com conhecimento profundo da base oficial (`flarum/framework` branch `2.x`),
+das convenções Friends of Flarum (FoF) e dos padrões Laravel 11/13 que o
+Flarum 2 herda.
+
+### 61.1 Princípios de operação
+
+1. **Não invente nada.** Todo `arquivo:linha` citado deve existir de fato no
+   repositório. Toda classe, método, namespace ou pacote citado deve estar
+   presente no código analisado ou ser referência verificável ao Flarum 2 /
+   Laravel.
+2. **Cite trechos curtos verbatim** quando útil para localizar o problema. Use
+   Grep/Glob/Read para mapear o código antes de escrever qualquer finding.
+3. **Seja técnico e específico em "Consertar".** Nada de "refatore para ficar
+   melhor". Sempre nomeie a classe/método/extender concreto do Flarum 2 que
+   substitui o padrão errado.
+4. **Não cite Flarum 1.x.** Flarum 2 introduziu mudanças massivas:
+   `ApiResource` substitui `ApiController` + `ApiSerializer`,
+   `AbstractDatabaseResource` substitui `AbstractSerializer`, Laravel 13
+   substitui Laravel 8, PHP 8.3 substitui PHP 7.3+. Não recomende APIs
+   descontinuadas.
+5. **Quando em dúvida, marque como "baixo" e descreva o porquê.** Preferível a
+   falsos positivos.
+
+### 61.2 Fluxo de auditoria (executar nesta ordem)
+
+#### Passo A — Mapeamento estrutural
+
+Execute (e cite trechos no relatório quando relevante):
+- Ler `composer.json` — extrair `name`, `version`, `require.php`,
+  `require.flarum/core`, `extra.flarum-extension.title`.
+- Ler `extend.php` — listar todos os Extenders usados.
+- Glob por `**/*.{php,ts,tsx,js,less,json}` excluindo `vendor/`,
+  `node_modules/`, `dist/`, `dist-typings/`.
+- Listar `migrations/`, `src/`, `js/src/`, `resources/`.
+- Ler `js/tsconfig.json`, `js/package.json`.
+- Ler primeiras linhas de cada migration para verificar formato.
+- Identificar arquivos PHP grandes (candidatos a funções >50 linhas).
+
+Use os resultados para preencher o cabeçalho (versão analisada) e ter
+inventário antes de procurar problemas.
+
+#### Passo B — Varreduras dirigidas
+
+Para cada convenção da §61.3, execute as varreduras Grep indicadas. Para cada
+hit, abra o arquivo via Read, valide o contexto (não é falso positivo?), e
+crie um finding com `arquivo:linha` exato.
+
+#### Passo C — Análise arquitetural
+
+Avalie:
+- Há injeção de dependência consistente?
+- Há transações de banco em operações multi-step?
+- Há cache de agregações pesadas?
+- A API está em `ApiResource` (Flarum 2) ou em `ApiController/ApiSerializer`
+  legados (Flarum 1, removidos)?
+- O frontend usa TypeScript com `flarum-tsconfig`?
+
+#### Passo D — Pontuação e veredito
+
+Calcule Pontuação de Qualidade e Codificado pela vibração conforme §61.5.
+Decida o veredito conforme §61.6.
+
+#### Passo E — Geração do relatório
+
+Escreva o relatório no formato exato da §61.7.
+
+### 61.3 Checklist de 18 convenções rastreáveis — Flarum 2.x
+
+Para cada item indico o **padrão errado a detectar** e o **fix canônico do
+Flarum 2**. Estes 18 itens orientam todas as varreduras.
+
+#### 61.3.1 Proibição de `resolve()` e `app()` globais
+- **Detectar:** `\b(resolve|app)\s*\(` em `src/` (excluir `$app` variável; `app(` em testes pode ser tolerado).
+- **Por quê:** Flarum 2 exige injeção via construtor. `app()` foi removido em estágios anteriores; `resolve()` é desencorajado em produção (acopla, dificulta testes, quebra com Octane).
+- **Fix canônico:** receber `Illuminate\Contracts\Container\Container` (ou a dependência concreta) no construtor. Em Service Providers, usar `$this->container` em `register()` e o argumento type-hinted em `boot(Container $container)`.
+
+#### 61.3.2 Helpers de migration obrigatórios
+- **Detectar:** `use Illuminate\\Database\\Schema\\Builder|'up' => function` em `migrations/`.
+- **Padrão errado:** retornar `['up' => function (Builder $schema) {...}, 'down' => ...]` chamando `$schema->create(...)` ou `$schema->table(...)` diretamente.
+- **Fix canônico:** usar os helpers estáticos de `Flarum\Database\Migration`:
+  - `Migration::createTable($name, fn (Blueprint $table) => …)`
+  - `Migration::createTableIfNotExists($name, fn (Blueprint $table) => …)`
+  - `Migration::renameTable($from, $to)`
+  - `Migration::addColumns($table, [...])` / `Migration::dropColumns($table, [...])`
+  - `Migration::renameColumn($table, $from, $to)` / `Migration::renameColumns($table, [...])`
+  - Para defaults: `Migration::addSettings([...])` e `Migration::addPermissions([...])`.
+- **Observação Flarum 2 / Laravel 11+:** ao alterar colunas, é obrigatório repetir a definição completa da coluna (inclusive `->nullable()`), pois Laravel 11+ não preserva modificadores implicitamente.
+
+#### 61.3.3 PHP ≥ 8.3 obrigatório
+- **Detectar:** `"php"\s*:` em `composer.json`.
+- **Padrão errado:** `"php": "^8.2"`, `"^8.1"`, `">=8.0"`, ou ausência da restrição.
+- **Fix canônico:** `"php": "^8.3"`. Flarum 2.0 exige PHP 8.3+; `flarum/core` v2.0.0-rc.1 (2026-04-18) declara exatamente `"php": "^8.3"`.
+
+#### 61.3.4 Filesystem do Laravel/Flarum em vez de funções nativas
+- **Detectar:** `\b(file_get_contents|file_put_contents|fopen|fwrite|fclose|fread|unlink|rename|mkdir|rmdir|is_dir|is_file|file_exists|copy|move_uploaded_file|scandir|glob)\s*\(` em `src/`.
+- **Padrão errado:** usar PHP nativo para qualquer escrita/leitura em diretórios gerenciados pelo Flarum (assets, avatars, uploads, anexos).
+- **Fix canônico:** injetar `Illuminate\Contracts\Filesystem\Factory` e obter o disco apropriado (`flarum-assets`, `flarum-avatars` ou disco custom registrado via `Extend\Filesystem`). Ler com `$disk->get($path)`, gravar com `$disk->put($path, $contents)`, deletar com `$disk->delete($path)`. Ver `Flarum\Api\Controller\DeleteLogoController` como referência.
+- **Exceção tolerada:** leitura de arquivos do próprio pacote da extensão (resources/views, locale, etc.).
+
+#### 61.3.5 Frontend deve usar TypeScript + `flarum-tsconfig`
+- **Detectar:**
+  - `js/tsconfig.json` deve existir.
+  - `flarum-tsconfig` deve estar em devDependencies de `js/package.json`.
+  - Devem existir arquivos TS em `js/src`.
+- **Padrão errado:** apenas `.js`/`.jsx` em `js/src`, ausência de `tsconfig.json`, ausência de `flarum-tsconfig` em devDependencies.
+- **Fix canônico:** `npm install --save-dev flarum-tsconfig@^2.0.0` e criar `js/tsconfig.json` estendendo `flarum-tsconfig`. Para Flarum 2: `flarum-webpack-config: ^3.0.0`, `flarum-tsconfig: ^2.0.0`.
+
+#### 61.3.6 `$dates` em models é descontinuado
+- **Detectar:** `protected \$dates` em `src/`.
+- **Padrão errado:** `protected $dates = ['some_at'];` em models Eloquent. Deprecada no Laravel 8, **removida no Laravel 10**; Flarum 2 usa Laravel 13.
+- **Fix canônico:** `protected $casts = ['some_at' => 'datetime'];`. Para o extender de outros models, usar `(new Extend\Model(User::class))->cast('some_at', 'datetime')`. `Extend\Model::dateAttribute()` está deprecated.
+
+#### 61.3.7 Atribuição em massa — `$guarded = []`
+- **Detectar:** `protected \$guarded\s*=\s*\[\s*\]` em `src/`.
+- **Padrão errado:** `$guarded = []` desabilita toda proteção contra mass-assignment.
+- **Fix canônico:** definir `$fillable` explicitamente, ou listar campos sensíveis em `$guarded` (ex.: `['id', 'is_admin']`).
+
+#### 61.3.8 Funções longas e aninhamento profundo (dívida técnica)
+- **Detectar:** para cada `.php` em `src/`, contar linhas de cada método. Funções com **>50 linhas** ou aninhamento >3 níveis → finding "médio" de dívida técnica.
+- **Fix canônico:** decompor em métodos privados nomeados pelo domínio (`assertNotFlooding()`, `extractMetadata()`, `persistRevision()`). Ver também §53.
+
+#### 61.3.9 Consultas N+1
+- **Detectar:** loops (`foreach`) que invocam método de relacionamento Eloquent sem `with()`/`load()` prévio.
+- **Padrão errado:** `foreach ($discussions as $d) { $d->user->name; }` sem `Discussion::with('user')->...`.
+- **Fix canônico:** eager loading via `->with([...])`, `->withCount([...])`, `->load([...])` ou, no Flarum 2, via `Endpoint\Index::make()->eagerLoad(['user'])` no `ApiResource`. Ver §38.1.
+
+#### 61.3.10 Cache de agregações pesadas
+- **Detectar:** controllers/listeners/serializers que executam `count()`, `sum()`, `groupBy()` sobre tabelas em crescimento (`posts`, `users`, `orders`, `discussions`) sem cachear.
+- **Fix canônico:** injetar `Illuminate\Contracts\Cache\Repository`, envolver com `$cache->remember($key, $ttl, fn() => $query)` (TTL 60s–1h conforme volatilidade). Invalidar via listener nos eventos de modificação. Atenção ao §24 (cache keys por ator).
+
+#### 61.3.11 Extenders corretos no `extend.php`
+- **Detectar:** `extend.php` que retorna closures (`function (Dispatcher $events) { … }`) em vez de objetos `Extend\*`. Em Flarum 2, cheiro forte de código portado mal.
+- **Extenders válidos do Flarum 2:** `Extend\Frontend`, `Extend\Routes`, `Extend\Model`, `Extend\ModelVisibility`, `Extend\ModelPrivate`, `Extend\ModelUrl`, `Extend\ApiResource` (substitui `ApiController` e `ApiSerializer`), `Extend\Event`, `Extend\Console`, `Extend\Settings`, `Extend\ServiceProvider`, `Extend\Policy`, `Extend\Notification`, `Extend\Filesystem`, `Extend\Filter`, `Extend\Formatter`, `Extend\Middleware`, `Extend\Post`, `Extend\Theme`, `Extend\View`, `Extend\Validator`, `Extend\LanguagePack`, `Extend\Locales`, `Extend\Mail`, `Extend\Session`, `Extend\ThrottleApi`, `Extend\SearchDriver`, `Extend\User`, `Extend\Link`, `Extend\Preload`, `Extend\Conditional`.
+- **Padrão errado em Flarum 2:** `Extend\ApiController` ou `Extend\ApiSerializer` — **foram removidos**. Migração é para `Extend\ApiResource(...)` apontando para uma classe que estende `Flarum\Api\Resource\AbstractDatabaseResource` (ou `AbstractResource`) e define `fields()`, `endpoints()`, `sorts()` via `Flarum\Api\Schema\*` e `Flarum\Api\Endpoint\*`.
+- **Também removidos:** `AbstractSerializeController`, `AbstractShowController`, `AbstractCreateController`, `AbstractUpdateController`, `AbstractDeleteController`, `AbstractSerializer`, `DiscussionValidator`, `PostValidator`, `UserValidator`, `TagValidator`, `GroupValidator`, `SuspendValidator`, e o singleton `flarum.forum.discussions.sortmap`.
+
+#### 61.3.12 Segurança
+- **Validação de input:** entradas dos endpoints devem passar por `Flarum\Foundation\AbstractValidator` (ou por validações declaradas em campos `Schema\Str::make(...)->rule(...)->maxLength(...)->regex(...)` do `ApiResource`). Detectar uso de `$request->getParsedBody()` ou `Arr::get($input, ...)` sem validação.
+- **Comparação de segredos:** grep por `===|!=` em linhas que mencionem `token|secret|signature|hmac` — comparações sensíveis devem usar `hash_equals($expected, $provided)`.
+- **Path traversal em ZIPs/uploads:** exigir `realpath()` resolvido + `str_starts_with($real, $baseDir . DIRECTORY_SEPARATOR)`. Ver §13.
+- **Mensagens de exceção:** `throw new \Exception($e->getMessage())` ou retornar `$e->getMessage()` ao usuário pode vazar caminhos/segredos. Mapear para tipos conhecidos do `Flarum\Foundation\ErrorHandling\Registry` ou usar mensagens em white-list.
+- **MIME do cliente:** nunca confie em `$file->getClientMediaType()`. Detectar pelo servidor com `finfo_file(finfo_open(FILEINFO_MIME_TYPE), $tmpPath)` ou `getimagesize()` para imagens. Ver §11.
+- **SVG sem sanitização:** detectar `accept image/svg+xml` ou `mimes:svg` sem `enshrined/svg-sanitize` ou equivalente. Ver §9.5.
+- **`libxml_use_internal_errors`:** sem restaurar com `libxml_use_internal_errors($previous)` é finding alto: vaza estado global para outras extensões e para o próximo request em ambientes long-running.
+- **Path traversal em LESS:** valores interpolados em LESS (via `Extend\Settings::registerLessConfigVar()`) devem ser validados — Flarum já sofreu CVE-2023-27577 e GHSA-xjvc-pw2r-6878 por `@import (inline)` injetável em settings de tema.
+
+#### 61.3.13 Condições de corrida em numeração sequencial
+- **Detectar:** atribuição de números sequenciais (`post_number`, `order_number`, `sequence`) calculados via `max() + 1` ou `count() + 1` sem transação isolada.
+- **Fix canônico:** envolver em `DB::transaction(function () { ... })` com `lockForUpdate()` na consulta agregadora, ou usar coluna `auto_increment` separada, ou padrão de "claim" com `INSERT IGNORE`.
+
+#### 61.3.14 Transações em operações multi-step
+- **Detectar:** sequências de `->save()`, `->update()`, `->insert()` sobre tabelas relacionadas, seguidas por dispatch de evento, sem `DB::transaction(...)`.
+- **Fix canônico:** `DB::transaction(function () use (...) { $post->save(); $discussion->update(...); event(new Posted($post)); });`.
+
+#### 61.3.15 Vazamento de dados sensíveis via API
+- **Detectar:** em `ApiResource::fields()`, campos do tipo `Schema\Str::make('client_secret')`, `'webhook_secret'`, `'internal_domain'`, `'api_token'` etc. expostos sem `->hidden()` ou sem `->visible(fn($m, $ctx) => $ctx->getActor()->isAdmin())`.
+- **Fix canônico:** marcar como `->hidden()` ou condicionar visibilidade ao ator. Para herança via `mutate()`, sempre filtrar antes de retornar. Ver §6.
+
+#### 61.3.16 Paginação em memória
+- **Detectar:** materializar coleções inteiras (`->get()->filter(...)->slice($offset, $limit)`) em vez de paginar no SQL.
+- **Fix canônico:** aplicar `where()`, `orderBy()`, `limit()`, `offset()` no query builder. No Flarum 2 API, configurar `Endpoint\Index::make()->paginate($default, $max)`. Ver §38.5.
+
+#### 61.3.17 Código morto
+- **Detectar:**
+  - `@deprecated` em `src/`.
+  - `TODO|FIXME|XXX` em `src/` e `js/src/`.
+  - Imports não usados (`use Foo;` sem referência a `Foo` no arquivo).
+  - Métodos privados sem chamada interna.
+- **Fix canônico:** remover. Se mantido por compatibilidade, documentar a razão e a data prevista de remoção. Ver §31.
+
+#### 61.3.18 Estado estático em classes utilitárias
+- **Detectar:** classes com `protected static $cache = []` ou similares que acumulam estado ao longo do processo. Em queue workers e em Laravel Octane, vaza entre requisições.
+- **Fix canônico:** converter em singleton registrado no container (`$container->singleton(Foo::class)`), com estado em propriedades de instância. Ver §44.2.
+
+### 61.4 Recursos do Flarum 2 que o auditor deve conhecer
+
+Para escrever "Consertar" corretamente, conhecimento da stack confirmada:
+
+- **Stack (Flarum core v2.0.0-rc.1, 2026-04-18):** PHP `^8.3`, `illuminate/*` em `^13.0` (Laravel 13), Carbon `^3.8.4`, Symfony 7.2 (transitivo via Laravel 13), Mithril 2.2, `doctrine/dbal: ^3.6`, `dflydev/fig-cookies: ^3.0`, `guzzlehttp/guzzle: ^7.7`, `flarum/json-api-server: ^0.1.0`, `fortawesome/font-awesome: ^7.0`.
+- **API layer:** `Flarum\Api\Resource\AbstractDatabaseResource` (modelos Eloquent) ou `AbstractResource` (recursos virtuais); campos via `Flarum\Api\Schema\Str|Number|Boolean|DateTime|Arr|Relationship\ToOne|Relationship\ToMany`; endpoints via `Flarum\Api\Endpoint\Index|Show|Create|Update|Delete`; políticas via `->can('permission')` ou Policy class.
+- **Search:** `AbstractSearcher` (substitui `AbstractFilterer`), filtros via classes em `Flarum\Search\Filter`; gambits foram movidos para o frontend.
+- **DB drivers em 2.0:** MySQL, MariaDB, SQLite e PostgreSQL suportados; usar `whenMysql`, `whenSqlite`, `whenPgsql` no query builder para SQL específico, e declarar `extra.database-support` no `composer.json` se necessário.
+- **Mithril 2.2:** `vnode.text` armazena texto de filho único; usar `extractText()` em extensões.
+- **Frontend imports:** `import X from 'ext:vendor/extension/common/...'` (prefixo `ext:` obrigatório em 2.0).
+- **Logout:** `POST /logout` (rota `logout`) + `GET /logout` (rota `logoutPage`).
+- **Translator:** preferir `Flarum\Locale\TranslatorInterface` ao `Symfony\Contracts\Translation\TranslatorInterface`.
+- **Avatares:** estáticos convertidos para WebP; GIFs animados preservados.
+- **Settings:** injetar `Flarum\Settings\SettingsRepositoryInterface`. Padrões via `Migration::addSettings([...])` ou `Extend\Settings::default(...)`.
+- **Permissões:** injetar `Flarum\User\User` e usar `$actor->can('permission')`. Padrões via `Migration::addPermissions([...])` ou `Extend\Policy`.
+- **Eventos:** `(new Extend\Event)->listen(Event::class, Listener::class)`. Listener é resolvido pelo container e recebe DI no construtor.
+
+### 61.5 Sistema de pontuação
+
+#### 61.5.1 Pontuação de Qualidade (0–100)
+
+Comece em **100**. Subtraia:
+
+| Gravidade do finding | Penalidade |
+|---|---|
+| Alto | −15 |
+| Médio | −5 |
+| Baixo | −2 |
+
+**Ajustes adicionais (após o cálculo bruto):**
+
+- **Penalidades estruturais (cumulativas, máx. −20):**
+  - −10 se `extend.php` ainda usa `Extend\ApiController` ou `Extend\ApiSerializer` (migração Flarum 1 → 2 não foi feita).
+  - −5 se ausência total de testes automatizados (`tests/` vazio ou inexistente).
+  - −5 se ausência de `tsconfig.json`/`flarum-tsconfig`.
+  - −5 se ausência de qualquer cache em hot paths com agregações.
+- **Bônus (cumulativos, máx. +10):**
+  - +3 se há testes de integração com `flarum/testing`.
+  - +3 se há injeção de dependência consistente em 100% das classes.
+  - +2 se há uso adequado de transações e cache.
+  - +2 se há documentação clara em `README.md` e tipagem completa no TS.
+
+**Faixas:**
+- 90–100: pronto para produção, extensão exemplar.
+- 75–89: pronto com ressalvas; melhorias recomendadas mas não bloqueantes.
+- 50–74: requer trabalho substancial antes de produção.
+- 0–49: não recomendado para uso em produção.
+
+Arredonde para inteiro. Limite mínimo: 0.
+
+**Nota de calibração:** esta rubrica difere do §48.3 (que usa pesos −25/−8/−3/−2
+com cap por dimensão e floor em 20). O §61 é mais punitivo no Alto (−15 vs −8)
+e mais leniente no Crítico — apropriado ao tom Floxum que trata "Alto" como
+ponto de corte de publicação. Não misture as duas rubricas no mesmo relatório.
+
+#### 61.5.2 Codificado pela vibração / "vibe coding" (0–100)
+
+**0 = certeza de autoria humana experiente. 100 = certeza de geração por IA não revisada.**
+
+Pondere os sinais; some pontos por sinal observado e some 10 pontos extras se
+≥ 4 sinais aparecem juntos.
+
+**Sinais de IA (somam pontos):**
+- Comentários "explicativos" redundantes que repetem o código (`// loop through each user` antes de `foreach ($users as $user)`): **+10**.
+- Nomenclatura inconsistente entre arquivos (`getUser`, `fetch_user`, `retrieveUserData` para a mesma operação): **+10**.
+- Tratamento de exceção genérico em todos os métodos (`try { ... } catch (\Exception $e) { Log::error($e); }`) sem distinção de tipos: **+10**.
+- Padrões de validação repetitivos que ignoram `AbstractValidator` do Flarum: **+5**.
+- Variáveis "defensivas" desnecessárias (`if (!is_null($x) && $x !== '' && !empty($x))` em vez de truthy check): **+5**.
+- Mensagens de exceção em inglês genérico ("Something went wrong", "An error occurred") sem contexto: **+5**.
+- Métodos com docblocks `@return mixed` ou `@param mixed`: **+3**.
+- Imports inutilizados ou ordenação aleatória de imports: **+3**.
+- Funções utilitárias reinventadas em vez de usar Laravel/Flarum (`function slugify($s)` em vez de `Str::slug`): **+5**.
+- Uso de termos não-Flarum (`Auth::user()` em vez do ator injetado, `DB::table('users')` em vez do model `User`): **+5**.
+
+**Sinais de autoria humana (subtraem):**
+- Comentários contextuais que explicam *o porquê*, não o quê (`// We can't use Cache::tags() because the file driver doesn't support it`): **−10**.
+- Otimizações específicas com referência a issue/PR conhecido: **−5**.
+- Uso idiomático de utilitários do Flarum (`Extend\Conditional`, `ModelVisibility` com closure inteligente, `Schema\Str::make()->set(fn ...)`): **−10**.
+- Decisões idiossincráticas justificadas em comentário: **−5**.
+- Tratamento de casos extremos com testes correspondentes: **−5**.
+
+**Faixas:**
+- 0–25: claramente humano experiente.
+- 26–50: provável humano com auxílio pontual de IA.
+- 51–75: provável geração por IA com revisão superficial.
+- 76–100: alto sinal de "vibe coding" sem revisão crítica.
+
+Limite: 0–100.
+
+### 61.6 Veredito de produção
+
+Escolha **exatamente uma** das duas frases (verbatim — a UI do Floxum faz
+match exato):
+
+- **"Aprovado com ressalvas; pode necessitar de alguns ajustes para ser seguro para uso em produção"** — quando **nenhum** finding de gravidade "alto" existe nas dimensões `segurança` ou `risco de produção`, **E** a Pontuação de Qualidade ≥ 70.
+- **"Esta extensão não é segura para produção em seu estado atual e requer correções específicas antes de poder ser listada"** — quando existe **pelo menos um** finding "alto" em `segurança` ou `risco de produção`, **OU** a Pontuação de Qualidade < 70, **OU** o `extend.php` ainda usa APIs removidas do Flarum 1 (`ApiController`/`ApiSerializer`/`AbstractSerializeController`/etc.).
+
+### 61.7 Formato exato do relatório (saída final)
+
+Gere **apenas** este Markdown ao final, substituindo placeholders. Não inclua
+preâmbulos nem rodapés além do que está aqui.
+
+````markdown
+# Revisão de código
+
+Esta revisão foi gerada com Claude Code sob instruções rigorosas de auditoria para extensões Flarum v2, replicando o estilo de análise do Floxum.
+
+**Status:** {veredito da §61.6, verbatim}
+
+- **Versão analisada:** {nome do pacote do `composer.json` @ versão git/tag, ou commit curto}
+- **Data/hora da revisão:** {ISO 8601 local}
+- **Pontuação de Qualidade:** {0–100}/100
+- **Codificado pela vibração:** {0–100}/100
+
+## Sumário executivo
+
+- {Frase 1 — veredito de publicação em linguagem objetiva, com a Pontuação como suporte}
+- {Frase 2 — principal problema de escalabilidade/performance com cenário concreto. Ex.: "Em um fórum com 50 000 posts, o endpoint `GET /api/extension/stats` executa um `COUNT(*)` não cacheado a cada request — em uma página de admin aberta por 10 moderadores simultâneos, isso é 10 full scans/min."}
+- {Frase 3 — avaliação arquitetural geral, positiva quando merecido, citando segurança, conhecimento de domínio, casos extremos tratados}
+- {Frase 4 — avaliação de eficiência de consultas e performance geral, citando presença/ausência de eager loading, cache e transações}
+
+## Resultados
+
+### {Título descritivo do finding 1}
+- **Gravidade:** alto | médio | baixo
+- **Dimensão:** convenções | segurança | dívida técnica | risco de produção | robustez | código morto | performance
+- **Localização:** `caminho/relativo/Arquivo.php:LINHA` (ou intervalo `:LINHA_INICIAL-LINHA_FINAL`)
+- **Problema:** {2–5 frases descrevendo concretamente o que está errado, citando o trecho relevante; explique o impacto operacional}
+- **Consertar:** {Instrução técnica específica nomeando as classes/métodos/extenders concretos do Flarum 2 que devem substituir o padrão errado. Sem genéricos.}
+
+### {Título descritivo do finding 2}
+- **Gravidade:** ...
+- **Dimensão:** ...
+- **Localização:** ...
+- **Problema:** ...
+- **Consertar:** ...
+
+{... repetir para todos os findings, ordenados por Gravidade (alto → baixo) e dentro de cada gravidade por Dimensão (segurança → risco de produção → robustez → performance → convenções → dívida técnica → código morto). Se a extensão for limpa, ainda gere ao menos 2–3 findings "baixo" para demonstrar que a varredura foi feita.}
+````
+
+### 61.8 Exemplos de findings bem escritos (calibração de tom)
+
+**Use estes exemplos apenas como referência de estilo.** Não copie textualmente
+nem invente situações análogas; gere findings **só sobre o que existir no
+repositório auditado**.
+
+#### Exemplo A — alto / segurança
+
+```
+### Comparação não-constante de token de webhook permite oracle de timing
+- **Gravidade:** alto
+- **Dimensão:** segurança
+- **Localização:** `src/Webhook/IncomingController.php:42`
+- **Problema:** o controlador compara a assinatura recebida com `$expected === $request->getHeader('X-Signature')[0]`. Comparação `===` em PHP curto-circuita no primeiro byte divergente, criando um oracle de timing remoto. Um atacante consegue inferir bytes do segredo em ~256 requisições por byte com latência de rede estável.
+- **Consertar:** trocar por `hash_equals($expected, (string) ($request->getHeader('X-Signature')[0] ?? ''))`. `hash_equals()` é a primitiva de comparação em tempo constante recomendada pela OWASP e usada pelo próprio Flarum em `Flarum\Http\AccessToken`.
+```
+
+#### Exemplo B — alto / risco de produção
+
+```
+### Migração usa Schema bruto em vez de helpers do Flarum
+- **Gravidade:** alto
+- **Dimensão:** risco de produção
+- **Localização:** `migrations/2024_03_10_000000_create_widgets_table.php:8-25`
+- **Problema:** a migração retorna `['up' => function (Builder $schema) {...}, 'down' => ...]` e chama `$schema->create('widgets', ...)` diretamente. Em instalações que tenham tido a extensão habilitada/purgada parcialmente, a tabela pode existir e a migração falhará com `Base table or view already exists`. O down também não é idempotente.
+- **Consertar:** substituir por `return Flarum\Database\Migration::createTableIfNotExists('widgets', function (Illuminate\Database\Schema\Blueprint $table) { $table->increments('id'); $table->string('name', 191); $table->timestamps(); });`. Para colunas adicionadas posteriormente, use `Migration::addColumns($table, [...])` que gera o `down` automaticamente.
+```
+
+#### Exemplo C — médio / performance
+
+```
+### Listagem de widgets carrega relação `user` em loop N+1
+- **Gravidade:** médio
+- **Dimensão:** performance
+- **Localização:** `src/Api/Resource/WidgetResource.php:38`
+- **Problema:** o campo `Schema\Relationship\ToOne::make('user')->includable()` está disponível como include, mas o endpoint `Endpoint\Index` não declara `eagerLoad(['user'])`. Quando o frontend pede `?include=user` para listar 50 widgets, são executadas 51 queries (1 + 50). Em um fórum com 200 widgets ativos e cache desligado, a página de admin de widgets fica em ~1,2 s só pelo DB.
+- **Consertar:** no `endpoints()`, alterar a entrada Index para `Endpoint\Index::make()->eagerLoad(['user'])->paginate(20, 50)`. Confirme com log de queries que o JOIN ou subselect ocorre.
+```
+
+#### Exemplo D — médio / convenções
+
+```
+### Uso de `resolve()` global em vez de injeção de dependência
+- **Gravidade:** médio
+- **Dimensão:** convenções
+- **Localização:** `src/Listener/NotifyOnPosted.php:19`
+- **Problema:** o listener obtém o `SettingsRepositoryInterface` via `resolve(SettingsRepositoryInterface::class)` dentro de `handle()`. Isso quebra a regra de DI do Flarum 2, torna a classe não testável sem boot completo do framework, e é problemático em ambientes long-running (Octane, queue workers persistentes), onde o estado do container pode estar reciclado.
+- **Consertar:** mover a dependência para o construtor: `public function __construct(private SettingsRepositoryInterface $settings) {}`. O container resolve automaticamente o listener via `Extend\Event::listen(Posted::class, NotifyOnPosted::class)`.
+```
+
+#### Exemplo E — baixo / código morto
+
+```
+### Import não utilizado de `Illuminate\Support\Arr`
+- **Gravidade:** baixo
+- **Dimensão:** código morto
+- **Localização:** `src/Api/Resource/WidgetResource.php:7`
+- **Problema:** `use Illuminate\Support\Arr;` está declarado mas `Arr::` não é referenciado em nenhum lugar do arquivo. Pequeno ruído, mas indica falta de revisão automatizada (PHPStan/Larastan apanharia).
+- **Consertar:** remover a linha. Considerar configurar `flarum/phpstan` no `composer.json` e rodar `vendor/bin/phpstan analyse` no CI para impedir regressões.
+```
+
+### 61.9 Restrições finais
+
+- **Não execute código** da extensão; análise é estática.
+- **Não baixe dependências reais**; se `vendor/` ou `node_modules/` existirem, ignore-os no escopo.
+- **Não fabricar findings** se a extensão for genuinamente boa. Nesse caso, gere apenas 2–3 findings "baixo" honestos e deixe a Pontuação alta.
+- **Se a extensão for Flarum 1.x** (detectado por `"flarum/core": "^1.0"` ou `"^0.1"` no `composer.json`), gere um único finding "alto" em `convenções` com o título *"Extensão não é compatível com Flarum 2.x"* e pare. Não tente auditar contra regras 2.x.
+- **Idioma do relatório:** português brasileiro, exceto identificadores de código (classes, métodos, namespaces) que mantêm a forma original.
+- **Tamanho esperado do relatório:** 800–2 500 palavras, dependendo do tamanho do código.
+
+### 61.10 Como esta seção se relaciona com o §48
+
+| Aspecto | §48 (inglês, marketplace) | §61 (PT-BR, Floxum) |
+|---|---|---|
+| Gatilho | `/review`, `/security-review`, `/ultrareview`, "review this" | "audita estilo Floxum", "/floxum", "audita esta extensão (PT-BR)" |
+| Idioma | Inglês | Português brasileiro |
+| Rubrica de Qualidade | −25/−8/−3/−2 com cap por dimensão, floor 20 | −15/−5/−2 com penalidades estruturais e bônus, floor 0 |
+| Vibe score | 0–100 (sinais positivos/negativos com pesos) | 0–100 (sinais de IA com +N; sinais humanos com −N) |
+| Frases-veredito | Três faixas: ≥80, 75–79, <75 | Duas frases canônicas (binário com gates de gravidade) |
+| Tabela de findings | 5 colunas (severity, dimensão, título, impacto) | Findings em forma de lista expandida (gravidade, dimensão, localização, problema, consertar) |
+| Pre-emit prompt | Pergunta "full report ou punch list?" | Emite o relatório direto, sem pergunta |
+
+**Regra de desambiguação:** quando o gatilho não é claro, default para §48 em
+inglês. Para forçar §61, o usuário precisa mencionar "Floxum" ou "PT-BR" ou
+o termo "estilo Floxum" explicitamente. Salve a preferência como feedback
+memory se o usuário repetir entre sessões.
 
 ---
 
