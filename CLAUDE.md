@@ -78,6 +78,13 @@ Base Github: https://github.com/ram0ng1/verified, https://github.com/ram0ng1/avo
 - §59 **Verificação HMAC deve devolver o modelo resolvido** — não re-consultar `Subscription`/`OrderItem` no controller depois que a camada de assinatura já fez o lookup; um endpoint público chamado a cada page load amplifica cada query duplicada por 100×
 - §60 **End-to-end testing harness** — `tests/E2E/` reusável (PHPUnit + Python + Edge headless): matriz de endpoints com happy/falha, screenshots reproduzíveis, probe de latência do webhook, testes de regressão de findings sem boot do Flarum
 - §61 **Traceable-conventions audit contract** — alternative output to §48: 18-convention checklist, Quality Score + Vibe Coded rubric, two canonical verdict phrases; report defaults to English with a PT-BR variant on explicit user request
+- §62 **Multi-write atomicity & DB transactions** — every flow writing to ≥2 rows/tables (checkout, webhook, chained observer, sequential numbering) runs inside `Model::query()->getConnection()->transaction(...)`; webhook idempotency via `firstOrCreate` + unique `event_id`; no `DB` facade
+- §63 **Request-derived state must be memoized** — the "phantom cart" bug: `scope()` minting a fresh random key on every call; memoize per `spl_object_id($request)`; never return an `id` from unconfirmed persistence
+- §64 **Validate input SHAPE before semantic rules** — `array_column` silently returns `[]` on a malformed shape and skips every downstream validator; duplicate keys in a PHP array literal overwrite silently
+- §65 **HTTP status & API surface symmetry** — 204 must not masquerade as soft-delete; a `create` response must compose into a read route that exists; 405-vs-404; probe every CRUD verb on every path
+- §66 **One trigger per state-change effect** — Observer + service firing the same post-payment effect = double execution; split by a discriminating column (`stripe_session_id`); webhook re-entrant work is idempotent
+- §67 **Error-handling completeness** — instrumented central API wrapper; every loading component has 3 states (`loading`/`error`/`data`); Mithril has no `componentDidCatch` (manual ErrorBoundary + `unhandledrejection`); `fetch()` checks `res.ok`; no empty PHP `catch`, no over-narrow catch type
+- §68 **Debug/maintenance scripts never ship in the package** — `fix_db.php`, `view_logs.php`, `test_boot.php`, `enable_ext.php` in the extension root become unauthenticated webroot endpoints (DB-wipe, log disclosure, app boot); delete them; vendor third-party packages via `composer require`, never by copying their `src/`
 
 ---
 
@@ -1463,6 +1470,22 @@ the chain.
 - Listener that mutates a different resource than the event source: re-run `assertCan` on the mutated resource. The originating event's permission check doesn't carry over.
 - Listener that calls a Service Bus command: pass the actor explicitly. Don't trust an inferred actor in the queue worker context.
 
+**Binding an instance method as a listener.** `Extend\Event::listen($event, $listener)`
+types `$listener` as `callable|string`. PHP's `callable` check rejects the array form
+`[MyListener::class, 'handle']` at boot when `handle` is a non-static instance method
+(it can't prove the method is callable without an instance). Two correct shapes:
+
+```php
+// Preferred — pass the class name; the container resolves it (full DI) and calls __invoke()
+(new Extend\Event())->listen(Posted::class, NotifyOnPosted::class),
+
+// For a named instance method, use Laravel's legacy 'Class@method' string —
+// the dispatcher resolves it through the container at dispatch time (DI + instance method).
+(new Extend\Event())->listen(Posted::class, NotifyOnPosted::class . '@handlePosted'),
+```
+
+Never inline a closure that needs dependencies — you lose container resolution.
+
 ### Console schedules (`Extend\Console::schedule`)
 
 Scheduled callbacks run with NO actor. The container resolves them as if invoked by
@@ -2487,6 +2510,32 @@ for "small" changes.**
 - [ ] `export()` filters by `user_id` AND `whereVisibleTo($user)` AND, where applicable, `is_private = false`.
 - [ ] Locale keys `flarum-gdpr.lib.data.<lowercased-type>.{export,anonymize,delete}_description` exist.
 - [ ] `gdpr.user.reservedAbilities` extension is wrapped in `$container->bound(...)`.
+
+### Atomicity, request state, API surface (§62–§66)
+
+- [ ] Every handler/observer/job with 2+ writes is wrapped in `Model::query()->getConnection()->transaction(...)` — not the `DB` facade (§62).
+- [ ] Webhook fulfillment is idempotent: unique `event_id` guard before the transaction, `firstOrCreate` for re-delivery-duplicable rows (§62).
+- [ ] Sequential numbering (`*_number`) uses `lockForUpdate()` inside a transaction (§62).
+- [ ] No request-derived identifier (session key, scope hash) is recomputed from `random_bytes`/`uniqid` on each call — memoized per `spl_object_id($request)` (§63).
+- [ ] No response returns an `id` before persistence is confirmed (§63).
+- [ ] Input *shape* is validated before any semantic rule — no `array_column`/`Arr::pluck` on an unvalidated body (§64).
+- [ ] No duplicate keys in any array literal / `->map()` item (§64).
+- [ ] No `204` masquerading as soft-delete; every `create` response composes into a working `GET /{id}`; every CRUD verb probed against every path (§65).
+- [ ] Every state-change effect has exactly one trigger per origin; Observer vs service mutually exclusive via a discriminating column (§66).
+
+### Error-handling completeness (§67)
+
+- [ ] Central API wrapper attaches a `.catch()` that alerts on 5xx/network and re-throws.
+- [ ] Every data-loading component has `loading` + `error` + `data` and renders all three.
+- [ ] `ErrorBoundary` per route/page + global `unhandledrejection` listener in both `index.tsx` files.
+- [ ] Every `fetch()` checks `res.ok`.
+- [ ] No empty PHP `catch`; no over-narrow catch type letting siblings escape to a 500; no `@`-suppressed I/O without a return-value check.
+
+### Hygiene — no debug scripts shipped (§68)
+
+- [ ] No `.php` in the extension root other than `extend.php` (no `fix_db.php`, `view_logs.php`, `test_boot.php`, `enable_ext.php`).
+- [ ] No third-party package vendored by copying its `src/` — declared via `composer require` instead.
+- [ ] No Laravel-Framework helpers (`response()->`, `public_path()`, `view()`, `redirect()`) in `src/` — they don't exist in Flarum.
 
 ### Build & lint
 
@@ -7598,6 +7647,531 @@ To opt into this §61 contract, the user must explicitly name it (e.g.
 adopt). Save the preference as a feedback memory if the user repeats the choice
 across sessions. The same rule applies to the language: default English, PT-BR
 only when explicitly asked.
+
+---
+
+## §62. Multi-write atomicity & DB transactions
+
+A request handler, observer, or job that writes to **two or more rows/tables** and
+fails mid-way leaves the database in a state no one can reconcile: an `Order` with
+`payment_status=pending` and only half its `OrderItem`s persisted, a stock counter
+decremented without the row that consumed it, a `Subscription` created by an Observer
+that fired off a parent `Order` event the controller never knew about. The
+ERROR_HANDLING audit of a real marketplace extension found **only two `transaction()`
+calls in the entire backend** while a dozen multi-write financial flows ran unprotected.
+
+### Locate
+
+```bash
+rg -n "->save\(\)|::create\(|->update\(|->insert\(|->delete\(\)|->decrement\(" src/
+rg -n "transaction\(|DB::transaction|getConnection\(\)->transaction" src/
+```
+
+For every controller/job/observer with **2+ writes** in `src/`, confirm a transaction
+wraps them. Checkout, webhook fulfillment, order-activation save, any "create parent +
+N children + bump a counter" shape — all need one.
+
+### Red flags
+
+- `Order::create(...)` followed by a `foreach` of `OrderItem::create(...)` with no transaction — failure on item N persists N−1 orphans.
+- An `Observer::saved()` that calls `Subscription::create(...)` — it runs *inside* the parent model's save, but the surrounding controller's writes are not in the same transaction unless the controller opened one.
+- Sequential numbering (`post_number`, `order_number`) computed via `max()+1` / `count()+1` with no `lockForUpdate()` — two concurrent requests collide on the same number.
+- `Illuminate\Support\Facades\DB::transaction(...)` — the `DB` facade root may be unset in some request/queue contexts (§10).
+- A webhook handler that re-runs fulfillment on Stripe's re-delivery because the work isn't idempotent.
+
+### Correct shape
+
+```php
+// Open the transaction off the model's own connection — never the DB facade,
+// never a constructor-injected ConnectionInterface (§10).
+Order::query()->getConnection()->transaction(function () use ($cart, $billing) {
+    $order = new Order();
+    $order->user_id = (int) $actor->id;
+    $order->save();
+
+    foreach ($cart->items() as $item) {
+        $line = new OrderItem();
+        $line->order_id = $order->id;
+        $line->save();
+        Product::query()->whereKey($item->productId)->lockForUpdate()->decrement('stock');
+    }
+
+    $order->payment_status = 'paid';
+    $order->save();
+});
+```
+
+### Webhook idempotency
+
+A webhook can be delivered more than once. Before the transaction, guard on a unique
+event id; inside, use `firstOrCreate` for any row the re-delivery would duplicate:
+
+```php
+if (WebhookEvent::query()->where('event_id', $event->id)->exists()) {
+    return new JsonResponse(['received' => true, 'deduped' => true]);
+}
+// ... inside the transaction:
+OrderActivation::firstOrCreate(
+    ['order_id' => $order->id, 'product_id' => $product->id],
+    ['status' => 'pending']
+);
+```
+
+A `UNIQUE` index on `event_id` is the authoritative guard — the application-level
+`exists()` check is racy under concurrency; pair it with `try/catch (QueryException)`
+on the insert.
+
+### Reference
+
+ERROR_HANDLING_AUDIT flagged `CreateCheckoutController` (`Order` + N×`OrderItem` +
+stock decrement + `OrderActivation` + N×`ActivationValue` + `$order->save()`) and
+`StripeWebhookController::handleSessionCompleted` (`$order->save` + `upsertSubscription`
++ `recordCoupon` + `claimAssets` + `provisionUser` + `sendWelcome`) as unprotected
+multi-write flows. Both must be one transaction each, with the webhook idempotency
+guard *before* the transaction opens.
+
+---
+
+## §63. Request-derived state must be memoized
+
+A value derived inside a request — a session key, a scope identifier, a context hash —
+that is **recomputed on every call** from a non-deterministic source (`random_bytes`,
+`uniqid`, `microtime`) produces a different value each time. If three layers of the
+same request (controller → service → totals) each call `derive()`, each sees a
+distinct value, and one layer's work is invisible to the next.
+
+### The phantom-cart bug (real incident)
+
+`CartManager::scope()` minted a guest's session key via `bin2hex(random_bytes(16))`
+when no `marketplace_cart` cookie was present. The handler called `scope()` **three
+times per request** (controller → `add()` → `totals()`), each producing a different
+random key:
+
+- The item persisted under key A.
+- The cookie was returned with key B.
+- `totals()` queried under key C → returned `count: 0`.
+
+`POST /cart/items` returned HTTP 201 with `{id: 140}` — a phantom row no client could
+ever reach (`PATCH`/`DELETE` on that id returned 422 "not found"). The response
+contradicted itself: `id: 140` alongside `totals.count: 0`.
+
+### Locate
+
+```bash
+rg -n "random_bytes|uniqid|bin2hex|microtime|Str::random" src/Service/ src/Api/
+```
+
+For each hit, ask: is this value consumed more than once in the same request? If so,
+it must be memoized.
+
+### Correct shape
+
+Memoize per `ServerRequestInterface` instance, keyed by `spl_object_id`:
+
+```php
+class CartManager
+{
+    /** @var array<int, string> */
+    private array $scopeCache = [];
+
+    public function scope(ServerRequestInterface $request): string
+    {
+        $oid = spl_object_id($request);
+        if (isset($this->scopeCache[$oid])) {
+            return $this->scopeCache[$oid];
+        }
+
+        $cookie = FigRequestCookies::get($request, 'marketplace_cart')->getValue();
+        $key = $cookie ?: bin2hex(random_bytes(16));
+
+        return $this->scopeCache[$oid] = $key;
+    }
+}
+```
+
+All three calls within one request now return the same key. For a guest's first write,
+force-`save()` the parent entity (Cart) **before** creating the child (CartItem) so the
+FK exists at insert time.
+
+### Never return an unconfirmed `id`
+
+The `POST` response returned `id: 140` before persistence was confirmed. **Returning a
+fake id is worse than returning nothing** — the client composes
+`PATCH /cart/items/140` and gets a 422. Only include the `id` after re-reading the row
+(or confirming the `count` from the joined totals, not from a fresh re-query).
+
+### Cross-reference
+
+§44.2 covers *static* state leaking across requests in workers; this section is the
+inverse — derived state that should persist **within** a request and doesn't. Both are
+fixed by tying the state's lifetime to the correct lifecycle (the request), never to a
+`static` and never to a recompute.
+
+---
+
+## §64. Validate input SHAPE before semantic rules
+
+Business-rule validators (`min_two_products`, `amount > 0`, `status in [...]`) assume
+the input already has the expected **format**. When the client sends a different shape,
+PHP extraction functions **fail silently** — they return `[]` or `null` instead of
+throwing — and every downstream semantic validator runs over empty data and passes.
+
+### The `array_column` footgun (real incident)
+
+`CreateBundleController` expected `items` in the object shape
+(`[{product_id, quantity}]`) and ran `array_column($items, 'product_id')`. When the
+client sent the legacy flat int-array shape (`[25, 26]`), `array_column` returned `[]`.
+`$productIds = []` skipped every subsequent validation. The bundle was created with a
+name + price and **zero products**. The `min_two_products` validator ran *after* the
+silent drop, so it never fired.
+
+### Locate
+
+```bash
+rg -n "array_column|array_map|array_filter|Arr::pluck" src/Api/ src/Service/
+rg -n "getParsedBody\(\)|\[.data.\]\[.attributes.\]" src/
+```
+
+### Red flags
+
+- `array_column($x, 'k')` / `Arr::pluck` over a body without first asserting each entry has the expected shape.
+- A business-rule validator that runs **after** an extraction that could have returned `[]`.
+- Duplicate keys in an array literal — `['type' => 'a', /* ... */ 'type' => 'b']` — PHP silently keeps the last one. `ListProductsController` had two `'type'` keys in the `->map()`-serialized item; the second silently overwrote the first.
+
+### Correct shape
+
+Validate the shape **before** any semantic rule, with an explicit failure:
+
+```php
+private function normalizeProductsInput(mixed $items): array
+{
+    if (! is_array($items)) {
+        throw new ValidationException(['items' => 'invalid_products_shape']);
+    }
+    $out = [];
+    foreach ($items as $entry) {
+        if (! is_array($entry) || ! isset($entry['product_id'])) {
+            throw new ValidationException(['items' => 'invalid_products_shape']);  // rejects the legacy array
+        }
+        $out[] = [
+            'product_id' => (int) $entry['product_id'],
+            'quantity'   => (int) ($entry['quantity'] ?? 1),
+        ];
+    }
+    return $out;
+}
+```
+
+Shape validation runs before `min_two_products` and every other rule. Apply the same
+guard in `UpdateBundleController` — otherwise a `PATCH` with the legacy shape silently
+wipes an existing bundle's products.
+
+For array-literal keys: visually review every large `->map()` / `return [` block — two
+keys of the same name at the same level is always a bug.
+
+---
+
+## §65. HTTP status & API surface symmetry
+
+The status code and the route shape are a contract. When the status lies about the
+real effect, or when one endpoint's response doesn't compose into a route that exists,
+the client makes wrong decisions — and the bug is invisible in code review because each
+piece, in isolation, "works".
+
+### Red flags (API surface audit)
+
+```bash
+rg -n "EmptyResponse\(204\)|JsonResponse\([^,]+, 20" src/Api/
+rg -n "->get\(|->post\(|->patch\(|->delete\(" extend.php
+```
+
+- **204 masquerading as soft-delete.** `DELETE /products/{id}` that flips `active=false`
+  and returns `204 No Content`. The client reads 204 as "row gone"; the row stays in the
+  DB. An idempotent re-`DELETE` returns 204 again, so the client can't distinguish
+  "never existed" from "I deleted it" from "already inactive". Return
+  `200 {data: {id, archived: true, hard_deleted: false}}` with a class docblock
+  explaining the archive semantics — or rename it to `POST /{id}/archive`.
+
+- **A `create` response that doesn't compose into a read route.** `POST /licenses`
+  returns `{id: N}`, inviting the client to build `GET /licenses/{id}` — which 404s
+  because only `by-key/{key}` and `{scope}/{id}` exist. If `create` returns an `id`,
+  a `GET /{id}` that resolves it must exist.
+
+- **405 vs 404 — asymmetric CRUD verbs.** Registering only `PATCH` and `DELETE` on
+  `/bundles/{id}` leaves `GET` falling into the "method not allowed" branch. A **405**
+  means "the route exists for other verbs but not this one"; a **404** means "the route
+  doesn't exist". Admin SPAs often refetch via the index + client-side filter, which
+  masks a missing `GET /{id}` — that's why it's a recurring blind spot.
+
+### Audit discipline
+
+When auditing an API, **probe every CRUD verb against every resource path**. Index /
+create / patch / delete passing while `GET /{id}` 405s is the exact shape of marketplace
+findings F3/F4/F6. For every `create` that returns an `id`, register the matching
+`Show` (`ShowBundleAdminController`, `ShowLicenseByScopeController`,
+`ShowProductAdminController` were all created to close this gap).
+
+---
+
+## §66. One trigger per state-change effect
+
+When an effect (claim an asset, provision a user, send a welcome email, create a
+pending activation) can be triggered by **more than one path** — an Eloquent Observer
+and an explicit service, say — and both run on the same transition, the effect executes
+**twice**.
+
+### The double-fulfillment bug (real incident)
+
+A marketplace order's post-payment effects ran twice for Stripe orders:
+
+- `OrderObserver::saved()` fired **synchronously, inside** the `EventProcessor`'s
+  transaction (under a row lock).
+- The `EventProcessor` then **repeated** claim/provision/welcome after commit.
+
+### Correct shape — split responsibility by origin
+
+Use a **discriminating column** to make the two paths mutually exclusive:
+
+```php
+class OrderObserver
+{
+    public function saved(Order $order): void
+    {
+        if ($order->payment_status !== 'paid') {
+            return;
+        }
+        // Stripe orders are finalized by the EventProcessor (from the webhook).
+        // The observer stays the canonical trigger only for non-Stripe orders.
+        if (! empty($order->stripe_session_id)) {
+            return;
+        }
+        $this->claimForOrder($order);
+        $this->provisionUser($order);
+        $this->sendWelcome($order);
+    }
+}
+```
+
+With the observer out of the Stripe path, the `EventProcessor` takes over **and** also
+creates the pending-activation records the observer used to create — idempotently,
+*post-commit*:
+
+```php
+private function createPendingActivations(Order $order): void
+{
+    foreach ($order->items as $item) {
+        if ($item->product?->activation_mode !== 'manual') {
+            continue;
+        }
+        OrderActivation::firstOrCreate(                       // idempotent — survives re-delivery
+            ['order_id' => $order->id, 'product_id' => $item->product_id],
+            ['status' => 'pending']
+        );
+    }
+}
+```
+
+### General rule
+
+- A state-change effect has **exactly one trigger per origin**.
+- When an Observer and a service can both fire on the same transition, split them by a
+  discriminating column; the guard comes **after** the status early-return and
+  **before** the first effect.
+- Webhook re-entrant work is always idempotent (`firstOrCreate`, never `create`).
+- Test the behavior by booting Eloquent over SQLite `:memory:`, degrading to
+  `markTestSkipped` when `pdo_sqlite` is absent; assert each collaborator is called
+  **exactly once** per origin.
+
+### Cross-reference
+
+§20 (listeners/observers and actor identity), §62 (webhook idempotency). This section
+is about the *count* of triggers; §20 is about *who* triggers.
+
+---
+
+## §67. Error-handling completeness
+
+A swallowed error is worse than a thrown one: the user clicks "Save", nothing happens,
+they click again, and the form ends up in a state no one can reconstruct. The
+ERROR_HANDLING audit of a real extension found error handling systematically absent —
+an API wrapper with no instrumentation, ~15 of 25 loading components with no error
+state, seven-plus empty `catch` blocks, and **zero** `console.*` calls in the entire
+frontend (when something fails, the error doesn't even reach DevTools).
+
+§40 covers frontend robustness point-by-point; this section is the **structure** that
+ensures no failure path is left orphaned.
+
+### 67.1 — Instrumented central API wrapper
+
+A 14-line `api.ts` that just forwards `app.request()` returning `Promise<any>` delegates
+100% of error handling to callers — who routinely forget. Attach a central `.catch()`
+that fires a generic alert on 5xx/network errors and **re-throws** so the caller can
+still handle the specific case:
+
+```ts
+export function api<T = unknown>(opts: FlarumRequestOptions): Promise<T> {
+  return app.request<T>(opts).catch((e) => {
+    const status = e?.status ?? 0;
+    if (status === 0 || status >= 500) {
+      app.alerts.show({ type: 'error' }, app.translator.trans('myext.network_error'));
+    }
+    throw e;                                                  // re-throw — the caller handles 4xx
+  });
+}
+```
+
+### 67.2 — Every loading component has three explicit states
+
+A component with `loading` but no `error` renders a network failure **identically** to
+"empty list" / "not found". The standard state is `{ loading, error, data }` and the
+`view` renders all three distinctly:
+
+```ts
+view() {
+  if (this.loading) return <LoadingIndicator />;
+  if (this.error)   return <div className="myext-error">{this.error}
+                              <Button onclick={() => this.load()}>{app.translator.trans('core.lib.retry')}</Button></div>;
+  if (!this.data?.length) return <p className="muted">{app.translator.trans('myext.empty')}</p>;
+  return /* success */;
+}
+```
+
+"Empty" and "network failure" must never look the same.
+
+### 67.3 — Mithril has no `componentDidCatch`
+
+Mithril (Flarum's framework) has no React-style error boundary; a render exception in
+any component crashes the whole page tree. Two defenses:
+
+1. An `ErrorBoundary extends Component` component that `try`s `vnode.children` and
+   stores `caughtError`, used around each route/page and around each third-party
+   widget/embed (never one per component — boundary-inside-boundary is a smell).
+2. A global listener registered in `forum/index.tsx` **and** `admin/index.tsx`:
+
+```ts
+window.addEventListener('unhandledrejection', (e) => {
+  app.alerts.show({ type: 'error' }, app.translator.trans('myext.unexpected_error'));
+  // structured log — see §67.5
+});
+```
+
+Boundaries do **not** catch event-handler errors, async errors, or SSR errors.
+
+### 67.4 — `fetch()` does not reject on HTTP error status
+
+`fetch()` resolves normally on a 4xx/5xx — it only rejects on a network failure. An
+upload via `fetch()` that doesn't check `res.ok` shows "saved" even when the backend
+rejected, leaving a product with no file:
+
+```ts
+const res = await fetch(url, { method: 'POST', body: form });
+if (!res.ok) {
+  throw new Error(`upload failed: ${res.status}`);
+}
+```
+
+### 67.5 — Backend: no empty `catch`, no over-narrow type
+
+```bash
+rg -n "catch\s*\([^)]*\)\s*\{\s*\}" src/                    # fully empty catch
+rg -n "catch\s*\(\\\\DomainException" src/                   # possibly over-narrow type
+rg -n "@file_get_contents|@file_put_contents|@fopen" src/    # error-suppressed I/O
+```
+
+- An empty **`catch (\Throwable) {}`** in a financial operation (the refund fallback
+  that lost the second error in an empty `catch`) is total error loss — always log +
+  re-throw.
+- **`catch (\DomainException)`** in a controller lets any other exception (DB, Stripe
+  connection) become a generic HTTP 500. Catch `\Throwable` with explicit mapping:
+  `DomainException` → 422, the rest → log + 500.
+- **`@fopen`/`@file_get_contents`** suppresses the error; check the return value
+  (`=== false`) and log structured. Inject `LoggerInterface` (§41) — never recover from
+  an error without leaving a trace.
+
+### 67.6 — UX failure-strategy matrix
+
+| Failure | Strategy |
+|---|---|
+| GET fails | inline error + reload button |
+| Write fails | toast + keep the form filled |
+| Optimistic action fails | revert local state + toast |
+| Timeout | specific message + retry with backoff (max 2×) |
+| 4xx | server message inline at the field |
+| 5xx | generic message + correlation id |
+| 401 | redirect to login preserving the route |
+| 403 | dedicated page (not 404) |
+| 404 | differentiate from "empty list" |
+
+---
+
+## §68. Debug/maintenance scripts never ship in the package
+
+A loose PHP file in the extension root — `fix_db.php`, `view_logs.php`, `test_boot.php`,
+`enable_ext.php`, `read_sys_logs.php`, `catch_migration.php` — is not just poor hygiene.
+If the extension is installed under a webroot, **each one becomes an unauthenticated
+HTTP endpoint** anyone on the internet can trigger.
+
+### The incident (real extension)
+
+The `extend-ads` extension shipped **eight** debug scripts in its root:
+
+- `fix_db.php` — opens a raw PDO connection from `config.php` and **`DELETE`s rows from
+  the `migrations` table** with no authentication. Anyone reaching
+  `https://forum/.../extend-ads/fix_db.php` destroys the forum's migration state.
+- `view_logs.php` / `read_sys_logs.php` / `latest_error.php` — dump Apache/nginx/PHP/
+  Flarum logs (hardcoded paths) to any request — direct information disclosure.
+- `enable_ext.php` / `test_boot.php` — boot the application and enable an extension with
+  no auth.
+
+Severity: 🔴 high when the extension root is servable, 🟠 medium otherwise — but always
+a release-blocker finding.
+
+### Locate
+
+```bash
+# Any .php in the extension root other than extend.php
+find . -maxdepth 1 -name '*.php' ! -name 'extend.php' 2>/dev/null
+# Debug-named scripts anywhere
+rg -l "new PDO\(|->boot\(\)|ExtensionManager.*enable|file_get_contents\(.*\.log" --glob '!vendor' --glob '!src' .
+```
+
+Any `.php` in the root other than `extend.php` is suspect. `src/` holds only
+PSR-4-autoloaded classes; executable scripts belong nowhere in the package.
+
+### Rule
+
+- **Delete them all.** Diagnostics live on a dev branch, in a gist, or in `tests/` —
+  never in a package that goes to Packagist. If you need a maintenance command, write an
+  `Extend\Console` command (runs via `php flarum`, requires shell access, is not an HTTP
+  endpoint).
+- **Hardcoded paths from another machine** (`e:/laragon/...` in a repo that lives on
+  `d:/laragon/...`) confirm the script is debug junk — it wouldn't even find the files
+  on the current machine.
+- **`.agent.md` / scaffolding metadata** with stale paths: clean or delete.
+
+### Vendoring a third-party dependency
+
+Related: the `websocket` extension autoloaded
+`"BeyondCode\\LaravelWebSockets\\": "BeyondCode/src/"` — a **copy of the source code** of
+`beyondcode/laravel-websockets` embedded in the repo instead of declared as a
+dependency. Vendored copies miss security patches and bloat the package. Always
+`composer require` the package; remove the copied `src/`. (Cross-ref §43 — dependency
+contracts.)
+
+### Phantom controllers with Laravel-Framework idioms
+
+Still in the "code that should never have shipped" family: `extend-ads` had two upload
+controllers, and the unwired one (`UploadImageController`) used `response()->json(...)`
+and `public_path(...)` — Laravel Framework helpers that **do not exist in Flarum** (same
+family as the `Illuminate\Foundation\Bus\Dispatchable` trap in §56). It would fatal if
+invoked. Delete it: it's dead code that is also a latent fatal.
+
+```bash
+rg -n "response\(\)->|public_path\(|base_path\(|storage_path\(|view\(|redirect\(\)" src/
+```
+
+Any hit in a Flarum extension's `src/` is a Laravel-Framework helper that doesn't exist
+— either the file is dead, or it will fatal in production.
 
 ---
 
